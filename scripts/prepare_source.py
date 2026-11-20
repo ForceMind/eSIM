@@ -14,9 +14,9 @@ import xml.etree.ElementTree as ET
 ROOT = Path(__file__).resolve().parent.parent
 UPSTREAM = "https://github.com/iebb/NekokoLPA2.git"
 BASELINE = "6d2145a515557941f10c5ebbf734d01f7d05fb43"
-APP_ID = "io.github.forcemind.nekokolpa.issue62.v2"
-APP_NAME = "eSIM Issue62 Test 2"
-VERSION = "2.5.0-issue62.2+2"
+APP_ID = "io.github.forcemind.nekokolpa.issue62.v3"
+APP_NAME = "9eSIM Test 3"
+VERSION = "2.5.0-issue62.3+3"
 ANDROID = "{http://schemas.android.com/apk/res/android}"
 ET.register_namespace("android", ANDROID[1:-1])
 
@@ -57,6 +57,15 @@ def main() -> None:
     text = replace_exact(text, 'manifestPlaceholders["appName"] = "NekokoLPA 2 Community"',
                          f'manifestPlaceholders["appName"] = "{APP_NAME}"')
     gradle.write_text(text)
+
+    # Keep the public shared core; make the in-app title identify this lab build.
+    # Card compatibility comes from the verified signer set, not this label.
+    settings = source / "lib/settings/app_settings.dart"
+    settings.write_text(replace_exact(
+        settings.read_text(),
+        "if (v == 'community') return 'NekokoLPA 2 Community';",
+        f"if (v == 'community') return '{APP_NAME}';",
+    ))
 
     manifest = source / "android/app/src/main/AndroidManifest.xml"
     tree = ET.fromstring(manifest.read_text())
@@ -102,7 +111,8 @@ def main() -> None:
         "upstream_repository": "iebb/NekokoLPA2", "upstream_commit": BASELINE,
         "application_id": APP_ID, "application_name": APP_NAME, "version": VERSION,
         "patch_sha256": hashlib.sha256(patch.read_bytes()).hexdigest(),
-        "signing_key": "ephemeral independent key generated only in the build job",
+        "signing_key": "independent ephemeral test key plus official published 9eSIM community key",
+        "signing_scheme": "APK v2 with two current signers; not signing lineage",
         "hardware_validation": "not performed",
     }
     (source / "issue62-build-info.json").write_text(json.dumps(metadata, indent=2) + "\n")

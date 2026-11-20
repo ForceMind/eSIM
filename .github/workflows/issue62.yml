@@ -117,21 +117,6 @@ jobs:
       - name: Prepare identical pinned source
         timeout-minutes: 3
         run: python3 scripts/prepare_source.py
-      - name: Generate independent ephemeral test key
-        run: |
-          set -euo pipefail
-          keytool -exportcert -keystore source/android/app/community.jks \
-            -storepass CommunityKey -alias communitykey -file dist/upstream-certificate.der
-          rm source/android/app/community.jks
-          keytool -genkeypair -noprompt -storetype JKS \
-            -keystore source/android/app/community.jks \
-            -alias communitykey -keyalg RSA -keysize 3072 \
-            -sigalg SHA256withRSA -validity 3650 \
-            -storepass CommunityKey -keypass CommunityKey \
-            -dname "CN=Issue62 Test 2, OU=Independent Test Build, O=ForceMind"
-          chmod 600 source/android/app/community.jks
-          keytool -exportcert -keystore source/android/app/community.jks \
-            -storepass CommunityKey -alias communitykey -file dist/test-certificate.der
       - name: Install Rust and Android build dependencies
         timeout-minutes: 8
         run: |
@@ -153,23 +138,30 @@ jobs:
             --target-platform android-arm64 \
             --dart-define=APP_VARIANT=community \
             --dart-define=GM_PSK_URL=https://key.9esim.com/psk 2>&1 | tee ../dist/build.log
-          cp build/app/outputs/flutter-apk/app-community-release.apk \
-            ../dist/eSIM-Issue62-Test2-arm64-v8a.apk
+      - name: Apply independent and public 9eSIM community signatures
+        timeout-minutes: 3
+        run: |
+          python3 scripts/sign_apk.py \
+            --input source/build/app/outputs/flutter-apk/app-community-release.apk \
+            --output dist/eSIM-Issue62-Test3-9eSIM-arm64-v8a.apk \
+            --apksigner "$ANDROID_HOME/build-tools/36.0.0/apksigner"
       - name: Verify package identity, release flags, ABI and signature
         run: python3 scripts/verify_apk.py
       - name: Upload tested and verified APK
         uses: actions/upload-artifact@v4
         with:
-          name: issue62-tested-coexist-apk
+          name: issue62-test3-9esim-coexist-apk
           if-no-files-found: error
           retention-days: 30
           path: |
-            dist/eSIM-Issue62-Test2-arm64-v8a.apk
+            dist/eSIM-Issue62-Test3-9eSIM-arm64-v8a.apk
             dist/SHA256SUMS.txt
             dist/build-info.json
             dist/signer.txt
             dist/apk-info.txt
             dist/test-certificate.der
+            dist/9esim-certificate.der
+            dist/signing-provenance.json
       - name: Preserve build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -178,6 +170,3 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
           path: dist/build.log
-      - name: Remove ephemeral private key
-        if: always()
-        run: rm -f source/android/app/community.jks
