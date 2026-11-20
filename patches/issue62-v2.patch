@@ -1,0 +1,220 @@
+diff --git a/android/app/src/main/kotlin/ee/nekoko/nlpa2/OmapiOpenFailures.kt b/android/app/src/main/kotlin/ee/nekoko/nlpa2/OmapiOpenFailures.kt
+new file mode 100644
+index 0000000..8af1a7c
+--- /dev/null
++++ b/android/app/src/main/kotlin/ee/nekoko/nlpa2/OmapiOpenFailures.kt
+@@ -0,0 +1,37 @@
++package ee.nekoko.nlpa2
++
++/**
++ * Retain access denials across an AID scan without skipping later usable AIDs.
++ *
++ * A missing applet must not overwrite a previous SecurityException. Conversely,
++ * an I/O failure or a null channel is not proof of a permission problem: preserve
++ * the existing recovery path in these mixed/ambiguous cases.
++ *
++ * This class does not grant card access or change any ARA-M rules.
++ */
++internal class OmapiOpenFailures {
++    private var lastError: Exception? = null
++    private var accessDenied: SecurityException? = null
++    private var operationalError: Exception? = null
++    private var channelUnavailable = false
++
++    fun record(error: Exception?) {
++        if (error == null) {
++            // OMAPI can return null when no channel is available.
++            channelUnavailable = true
++            return
++        }
++        lastError = error
++        when (error) {
++            is SecurityException -> if (accessDenied == null) accessDenied = error
++            is java.util.NoSuchElementException -> Unit
++            else -> if (operationalError == null) operationalError = error
++        }
++    }
++
++    val permissionDenied: Boolean
++        get() = accessDenied != null && operationalError == null && !channelUnavailable
++
++    val errorForRetry: Exception?
++        get() = operationalError ?: lastError
++}
+diff --git a/android/app/src/main/kotlin/ee/nekoko/nlpa2/OmapiPlugin.kt b/android/app/src/main/kotlin/ee/nekoko/nlpa2/OmapiPlugin.kt
+index b420158..63c0ab4 100644
+--- a/android/app/src/main/kotlin/ee/nekoko/nlpa2/OmapiPlugin.kt
++++ b/android/app/src/main/kotlin/ee/nekoko/nlpa2/OmapiPlugin.kt
+@@ -861,7 +861,7 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+ 
+         val targets =
+                 if (aidsList != null && aidsList.isNotEmpty()) aidsList else listOf(singleAid!!)
+-        var lastError: Exception? = null
++        val failures = OmapiOpenFailures()
+ 
+         // Background thread work
+         for (targetAid in targets) {
+@@ -894,23 +894,32 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+                     runOnUiThread { result.success(responseMap) }
+                     return
+                 }
++                failures.record(null)
+             } catch (e: Exception) {
+-                // Check if fatal or just not found
+-                lastError = e
+-                val message = e.message ?: ""
+-
+-                // If specific access control or other fatal error, might want to stop?
+-                // For now, assume iteration continues unless it's a session death.
++                failures.record(e)
++                // A denied candidate does not rule out another permitted AID.
+                 if (e is SecurityException) {
+                     Log.w(TAG, "Security exception for AID $targetAid: ${e.message}")
+                 }
+             }
+         }
+ 
+-        // If we get here, no AID worked.
+-        // Check if we should retry (only if single AID really, or if session looks dead)
++        // No candidate opened. Preserve permission failures instead of collapsing
++        // them to CHANNEL_FAILED or treating them as a stale-session condition.
++        if (failures.permissionDenied) {
++            return runOnUiThread {
++                result.error(
++                        "SECURITY_EXCEPTION",
++                        "OMAPI denied access to the requested applications. Check the card's access rules for this app.",
++                        mapOf("operation" to "openChannel", "permissionDenied" to true),
++                )
++            }
++        }
++        val lastError = failures.errorForRetry
++
++        // Keep the existing bounded recovery for non-permission failures.
+         if (!isRetry && lastError != null) {
+-            val message = lastError!!.message ?: ""
++            val message = lastError.message ?: ""
+             // "OpenLogicalChannel() failed" and NoSuchElementException are typically native/driver
+             // state issues.
+             // We should retry these even if we haven't successfully opened a channel before,
+@@ -949,7 +958,13 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+             }
+         }
+         runOnUiThread {
+-            result.error("CHANNEL_FAILED", lastError?.message ?: "No AID opened", null)
++            result.error(
++                    "CHANNEL_FAILED",
++                    lastError?.message ?: "No AID opened",
++                    // Mixed I/O/null-channel outcomes are not permission-only failures.
++                    // Dart must not reinterpret one candidate's denial text as a diagnosis.
++                    mapOf("operation" to "openChannel", "permissionDenied" to false),
++            )
+         }
+     }
+ 
+diff --git a/lib/adapter/omapi/omapi_access_errors.dart b/lib/adapter/omapi/omapi_access_errors.dart
+new file mode 100644
+index 0000000..40d97b3
+--- /dev/null
++++ b/lib/adapter/omapi/omapi_access_errors.dart
+@@ -0,0 +1,34 @@
++import 'package:flutter/services.dart';
++
++import '../../utils/error_codes.dart';
++
++/// Only recognizes explicit access-denial evidence, never a generic channel
++/// failure. This does not diagnose which ARA-M rule (if any) caused the denial.
++bool isOmapiAccessDeniedError(Object error) {
++  if (error is AppException) {
++    return error.code == AppErrorCode.ERROR_OMAPI_PERMISSION_DENIED ||
++        error.code == AppErrorCode.ERROR_OMAPI_SECURITYEXCEPTION;
++  }
++  if (error is! PlatformException) return false;
++
++  switch (error.code) {
++    case 'SECURITY_EXCEPTION':
++    case 'SecurityException':
++    case 'AccessControlException':
++      return true;
++  }
++
++  // Compatibility with older native bridges that erased the exception type.
++  // Never let text override a safety-latch, busy, or unrelated error code.
++  if (error.code != 'CHANNEL_FAILED' && error.code != 'CONNECTION_FAILED') {
++    return false;
++  }
++  // New native bridges preserve the aggregate classification for mixed or
++  // ambiguous outcomes. A single candidate's denial message must not override it.
++  final details = error.details;
++  if (details is Map && details['permissionDenied'] == false) return false;
++
++  final message = error.message?.trim().toLowerCase() ?? '';
++  return message.contains('no apdu access allowed') ||
++      message.startsWith('access denied by ara-m:');
++}
+diff --git a/lib/adapter/omapi/omapi_adapter.dart b/lib/adapter/omapi/omapi_adapter.dart
+index 937a4a3..dec18df 100644
+--- a/lib/adapter/omapi/omapi_adapter.dart
++++ b/lib/adapter/omapi/omapi_adapter.dart
+@@ -8,6 +8,7 @@ import '../../settings/app_settings.dart';
+ import '../../utils/error_codes.dart';
+ import '../../utils/apdu_exception.dart';
+ import 'omapi_safety.dart';
++import 'omapi_access_errors.dart';
+ 
+ const Set<String> _estkSlotAids = {
+   'A06573746B6D65FFFF4953442D522030',
+@@ -216,7 +217,7 @@ class OmapiAdapter extends BaseAdapter {
+       } on PlatformException catch (e) {
+         if (isOmapiSessionCorruptedError(e)) rethrow;
+         log.severe('Failed to connect to OMAPI reader: $e');
+-        if (e.code == 'SecurityException') {
++        if (isOmapiAccessDeniedError(e)) {
+           throw AppException(
+             AppErrorCode.ERROR_OMAPI_SECURITYEXCEPTION,
+             originalError: e,
+@@ -429,12 +430,10 @@ class OmapiAdapter extends BaseAdapter {
+               originalError: e,
+             );
+           }
+-          if (e is PlatformException &&
+-              (e.code == 'AccessControlException' ||
+-                  e.message == 'no APDU access allowed')) {
++          if (isOmapiAccessDeniedError(e)) {
+             throw AppException(
+               AppErrorCode.ERROR_OMAPI_PERMISSION_DENIED,
+-              message: 'ARA-M permissions not allowed',
++              message: 'OMAPI access denied by card access-control rules',
+               originalError: e,
+             );
+           }
+@@ -614,7 +613,14 @@ class OmapiAdapter extends BaseAdapter {
+         return resultMap;
+       } catch (e) {
+         if (isOmapiSessionCorruptedError(e)) rethrow;
+-        // If first attempt fails, try heavy cleanup and retry once.
++        if (isOmapiAccessDeniedError(e)) {
++          throw AppException(
++            AppErrorCode.ERROR_OMAPI_PERMISSION_DENIED,
++            message: 'OMAPI access denied by card access-control rules',
++            originalError: e,
++          );
++        }
++        // Only non-permission failures can benefit from cleanup and retry.
+         log.warning(
+           'Initial openChannel for $aidHex failed ($e). Retrying after cleanup...',
+         );
+@@ -644,12 +650,10 @@ class OmapiAdapter extends BaseAdapter {
+           }
+           log.severe('Retry openChannel failed for $aidHex: $retryE');
+           if (isOmapiSessionCorruptedError(retryE)) rethrow;
+-          if (retryE is PlatformException &&
+-              (retryE.code == 'AccessControlException' ||
+-                  retryE.message == 'no APDU access allowed')) {
++          if (isOmapiAccessDeniedError(retryE)) {
+             throw AppException(
+               AppErrorCode.ERROR_OMAPI_PERMISSION_DENIED,
+-              message: 'ARA-M permissions not allowed',
++              message: 'OMAPI access denied by card access-control rules',
+               originalError: retryE,
+             );
+           }

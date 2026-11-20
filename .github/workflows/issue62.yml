@@ -1,0 +1,183 @@
+name: Issue62 tests and coexist APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/issue62.yml'
+      - 'patches/**'
+      - 'scripts/**'
+      - 'tests/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue62-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: '3.47.2'
+  RUST_VERSION: '1.99.1'
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  tests:
+    name: Kotlin and Flutter regression tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/.ghcup /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+          mkdir -p test-results
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Prepare pinned source and regression tests
+        timeout-minutes: 3
+        run: python3 scripts/prepare_source.py
+      - name: Install Kotlin compiler
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 2 --max-time 120 \
+            https://github.com/JetBrains/kotlin/releases/download/v1.9.25/kotlin-compiler-1.9.25.zip \
+            -o "$RUNNER_TEMP/kotlin.zip"
+          unzip -q "$RUNNER_TEMP/kotlin.zip" -d "$RUNNER_TEMP/kotlin"
+          echo "$RUNNER_TEMP/kotlin/kotlinc/bin" >> "$GITHUB_PATH"
+      - name: Test actual Kotlin channel-opening implementation
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          python3 tests/run_native_tests.py source test-results/native 2>&1 | tee test-results/native.log
+      - name: Resolve locked Flutter dependencies
+        timeout-minutes: 5
+        working-directory: source
+        run: flutter pub get --enforce-lockfile
+      - name: Analyze changed Dart code
+        timeout-minutes: 3
+        working-directory: source
+        run: |
+          set -euo pipefail
+          dart analyze lib/adapter/omapi/omapi_access_errors.dart \
+            lib/adapter/omapi/omapi_adapter.dart test/issue62/ 2>&1 | tee ../test-results/dart-analyze.log
+      - name: Run Flutter tests
+        timeout-minutes: 8
+        working-directory: source
+        run: |
+          set -euo pipefail
+          flutter test --no-pub --reporter expanded --timeout 60s 2>&1 | tee ../test-results/flutter-test.log
+      - name: Preserve test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue62-test-reports
+          path: test-results/
+          if-no-files-found: error
+          retention-days: 30
+
+  apk:
+    name: Build and verify ARM64 release APK
+    needs: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/.ghcup /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/lib/android/sdk/ndk /usr/local/lib/android/sdk/system-images
+          df -h /
+          mkdir -p dist
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Prepare identical pinned source
+        timeout-minutes: 3
+        run: python3 scripts/prepare_source.py
+      - name: Generate independent ephemeral test key
+        run: |
+          set -euo pipefail
+          keytool -exportcert -keystore source/android/app/community.jks \
+            -storepass CommunityKey -alias communitykey -file dist/upstream-certificate.der
+          rm source/android/app/community.jks
+          keytool -genkeypair -noprompt -storetype JKS \
+            -keystore source/android/app/community.jks \
+            -alias communitykey -keyalg RSA -keysize 3072 \
+            -sigalg SHA256withRSA -validity 3650 \
+            -storepass CommunityKey -keypass CommunityKey \
+            -dname "CN=Issue62 Test 2, OU=Independent Test Build, O=ForceMind"
+          chmod 600 source/android/app/community.jks
+          keytool -exportcert -keystore source/android/app/community.jks \
+            -storepass CommunityKey -alias communitykey -file dist/test-certificate.der
+      - name: Install Rust and Android build dependencies
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          rustup target add aarch64-linux-android
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+          df -h /
+          test "$(df --output=avail -k / | tail -1)" -gt 15728640
+      - name: Resolve locked dependencies and build release APK
+        timeout-minutes: 28
+        working-directory: source
+        run: |
+          set -euo pipefail
+          flutter pub get --enforce-lockfile
+          flutter build apk --no-pub --release --flavor community \
+            --target-platform android-arm64 \
+            --dart-define=APP_VARIANT=community \
+            --dart-define=GM_PSK_URL=https://key.9esim.com/psk 2>&1 | tee ../dist/build.log
+          cp build/app/outputs/flutter-apk/app-community-release.apk \
+            ../dist/eSIM-Issue62-Test2-arm64-v8a.apk
+      - name: Verify package identity, release flags, ABI and signature
+        run: python3 scripts/verify_apk.py
+      - name: Upload tested and verified APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue62-tested-coexist-apk
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            dist/eSIM-Issue62-Test2-arm64-v8a.apk
+            dist/SHA256SUMS.txt
+            dist/build-info.json
+            dist/signer.txt
+            dist/apk-info.txt
+            dist/test-certificate.der
+      - name: Preserve build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue62-build-diagnostics
+          if-no-files-found: ignore
+          retention-days: 30
+          path: dist/build.log
+      - name: Remove ephemeral private key
+        if: always()
+        run: rm -f source/android/app/community.jks

@@ -1,0 +1,235 @@
+@file:Suppress("UNUSED_PARAMETER", "DEPRECATION", "UNNECESSARY_NOT_NULL_ASSERTION")
+package ee.nekoko.nlpa2
+
+import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
+
+// Test doubles only. run_native_tests.py extracts the function under test from
+// the actual checked-out production source for every run. These tests make no
+// claim about the behavior of a real Android device or card.
+annotation class RequiresApi(val value: Int)
+object Build { object VERSION_CODES { const val P = 28 } }
+object Log {
+    fun i(tag: String, msg: String) {}
+    fun w(tag: String, msg: String) {}
+    fun e(tag: String, msg: String, error: Exception) {}
+}
+class MethodCall(private val args: Map<String, Any>) {
+    @Suppress("UNCHECKED_CAST")
+    fun <T> argument(key: String): T? = args[key] as T?
+}
+class Result {
+    var code: String? = null
+    var message: String? = null
+    var value: Any? = null
+    var details: Any? = null
+    var replies = 0
+    fun error(code: String, message: String?, details: Any?) {
+        check(++replies == 1) { "result completed twice" }
+        this.code = code; this.message = message; this.details = details
+    }
+    fun success(value: Any?) {
+        check(++replies == 1) { "result completed twice" }; this.value = value
+    }
+}
+class Channel(val selectResponse: ByteArray? = byteArrayOf(0x90.toByte(), 0))
+class Session(val open: (ByteArray) -> Channel?) {
+    fun openLogicalChannel(aid: ByteArray): Channel? = open(aid)
+}
+class Reader(val name: String, val session: Session) {
+    fun openSession(): Session = session
+}
+class SEService(val readers: List<Reader>)
+private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
+private fun hexStringToByteArray(hex: String): ByteArray {
+    require(hex.length % 2 == 0) { "Hex string must have an even length" }
+    return ByteArray(hex.length / 2) { i -> hex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
+}
+
+class Harness(
+    private val outcome: (String, Int) -> Any?,
+    knownReader: Boolean = false,
+    private val poisoned: Boolean = false,
+    private val poisonOnCleanup: Boolean = false,
+    private val noSession: Boolean = false,
+) {
+    companion object { const val TAG = "OmapiPlugin" }
+    val readerSessions = mutableMapOf<String, Session>()
+    val readerChannels = mutableMapOf<String, ConcurrentHashMap<String, Channel>>()
+    val readersWithSuccessfulChannel = mutableSetOf<String>()
+    var calls = 0
+    var cleanups = 0
+    private val session = Session { aid ->
+        val answer = outcome(aid.toHex().uppercase(), ++calls)
+        if (answer is Exception) throw answer
+        answer as Channel?
+    }
+    private val seService: SEService? = SEService(listOf(Reader("SIM1", session)))
+    init {
+        if (knownReader) readersWithSuccessfulChannel.add("SIM1")
+        readerChannels["SIM1"] = ConcurrentHashMap()
+    }
+    private fun rejectIfPoisoned(result: Result): Boolean {
+        if (poisoned) result.error("OMAPI_SESSION_CORRUPTED", "reboot required", null)
+        return poisoned
+    }
+    private fun normalizeReaderName(value: String) = value.substringBefore('|').substringBefore(" (").trim()
+    private fun getOrCreateSession(reader: String): Session? = if (noSession) null else session
+    private fun runOnUiThread(action: () -> Unit) = action()
+    private fun trackNewChannelOrReject(reader: String, aid: String, channel: Channel, result: Result): Boolean {
+        check(readerChannels.getValue(reader).putIfAbsent(aid.uppercase(), channel) == null)
+        return true
+    }
+    private fun cleanupReaderSessions(reader: String): Boolean {
+        cleanups++
+        readerSessions.remove(reader)
+        readerChannels.remove(reader)
+        readersWithSuccessfulChannel.remove(reader)
+        return poisonOnCleanup
+    }
+    private fun reportCleanupFailure(result: Result, failed: Boolean): Boolean {
+        if (failed) result.error("OMAPI_SESSION_CORRUPTED", "cleanup failed", null)
+        return failed
+    }
+    fun open(aids: List<String> = listOf("A000000001")): Result {
+        val result = Result()
+        handleOpenChannel(MethodCall(mapOf("reader" to "SIM1", "aids" to aids)), result)
+        check(result.replies == 1)
+        return result
+    }
+
+// BEGIN ACTUAL UPSTREAM / PATCHED METHOD
+@@METHOD@@
+// END ACTUAL METHOD
+}
+
+fun main() {
+    var passed = 0
+    var failed = 0
+    fun case(name: String, test: () -> Unit) {
+        try { test(); passed++; println("PASS: $name") }
+        catch (e: Throwable) { failed++; println("FAIL: $name: ${e.message}") }
+    }
+    fun denied(result: Result) {
+        check(result.code == "SECURITY_EXCEPTION") { "expected SECURITY_EXCEPTION, got ${result.code}" }
+        check((result.details as? Map<*, *>)?.get("permissionDenied") == true)
+    }
+    val first = "A000000001"
+    val second = "A000000002"
+    case("single SecurityException retains its type") {
+        val h = Harness({ _, _ -> SecurityException("not permitted") })
+        denied(h.open()); check(h.calls == 1 && h.cleanups == 0)
+    }
+    case("access denial on previously working reader is not cleaned/retried") {
+        val h = Harness({ _, _ -> SecurityException("not permitted") }, knownReader = true)
+        denied(h.open()); check(h.calls == 1 && h.cleanups == 0)
+    }
+    case("AccessControlException is also a permission failure") {
+        val h = Harness({ _, _ -> java.security.AccessControlException("no APDU access allowed") })
+        denied(h.open()); check(h.cleanups == 0)
+    }
+    case("later missing AID does not erase earlier denial") {
+        val h = Harness({ aid, _ -> if (aid == first) SecurityException("denied") else NoSuchElementException("not found") })
+        denied(h.open(listOf(first, second))); check(h.calls == 2 && h.cleanups == 0)
+    }
+    case("missing AID followed by denial retains the denial") {
+        val h = Harness({ aid, _ -> if (aid == first) NoSuchElementException("not found") else SecurityException("denied") })
+        denied(h.open(listOf(first, second))); check(h.calls == 2 && h.cleanups == 0)
+    }
+    case("denied first candidate does not block permitted fallback") {
+        val h = Harness({ aid, _ -> if (aid == first) SecurityException("denied") else Channel() })
+        val r = h.open(listOf(first, second))
+        check(r.code == null && (r.value as Map<*, *>)["aid"] == second)
+        check(h.calls == 2 && h.cleanups == 0)
+    }
+    case("I/O failure is not relabeled permission denied by a later denial") {
+        val h = Harness({ aid, _ -> if (aid == first) IOException("OpenLogicalChannel() failed: radio unavailable") else SecurityException("denied") })
+        val r = h.open(listOf(first, second))
+        check(r.code == "CHANNEL_FAILED" && r.message!!.contains("radio unavailable"))
+        check(h.cleanups == 1 && h.calls == 4)
+    }
+    case("null channel plus denial remains ambiguous, not permission-only") {
+        val h = Harness({ aid, _ -> if (aid == first) null else SecurityException("denied") })
+        check(h.open(listOf(first, second)).code == "CHANNEL_FAILED")
+        check(h.calls == 2)
+    }
+    case("denial followed by null channel remains ambiguous") {
+        val h = Harness({ aid, _ -> if (aid == first) SecurityException("denied") else null })
+        check(h.open(listOf(first, second)).code == "CHANNEL_FAILED")
+    }
+    case("null plus APDU-denial text carries explicit aggregate classification") {
+        val h = Harness({ aid, _ -> if (aid == first) null else SecurityException("no APDU access allowed") })
+        val r = h.open(listOf(first, second))
+        check(r.code == "CHANNEL_FAILED")
+        check(r.message == "no APDU access allowed")
+        check((r.details as? Map<*, *>)?.get("permissionDenied") == false)
+        check(h.calls == 2 && h.cleanups == 0)
+    }
+    case("APDU-denial text plus null stays ambiguous after bounded retry") {
+        val h = Harness({ aid, _ -> if (aid == first) SecurityException("no APDU access allowed") else null }, knownReader = true)
+        val r = h.open(listOf(first, second))
+        check(r.code == "CHANNEL_FAILED")
+        check((r.details as? Map<*, *>)?.get("permissionDenied") == false)
+        check(h.calls == 4 && h.cleanups == 1)
+    }
+    case("I/O aggregate classification cannot be overridden by denial text") {
+        val h = Harness({ aid, _ -> if (aid == first) IOException("no APDU access allowed") else SecurityException("denied") })
+        val r = h.open(listOf(first, second))
+        check(r.code == "CHANNEL_FAILED")
+        check((r.details as? Map<*, *>)?.get("permissionDenied") == false)
+        check(h.calls == 2 && h.cleanups == 0)
+    }
+    case("missing-only errors retain bounded infrastructure retry") {
+        val h = Harness({ _, _ -> NoSuchElementException("not found") })
+        check(h.open().code == "CHANNEL_FAILED")
+        check(h.calls == 2 && h.cleanups == 1)
+    }
+    case("first candidate success stops scanning") {
+        val h = Harness({ _, _ -> Channel() })
+        check(h.open(listOf(first, second)).code == null)
+        check(h.calls == 1 && h.cleanups == 0)
+    }
+    case("empty AID list remains invalid and performs no card I/O") {
+        val h = Harness({ _, _ -> Channel() })
+        check(h.open(emptyList()).code == "INVALID_ARGUMENT")
+        check(h.calls == 0 && h.cleanups == 0)
+    }
+    case("existing poisoned-state guard is preserved") {
+        val h = Harness({ _, _ -> Channel() }, poisoned = true)
+        check(h.open().code == "OMAPI_SESSION_CORRUPTED")
+        check(h.calls == 0 && h.cleanups == 0)
+    }
+    case("real infrastructure error can recover on the single retry") {
+        val h = Harness({ _, call -> if (call == 1) IOException("OpenLogicalChannel() failed") else Channel() })
+        check(h.open().code == null)
+        check(h.calls == 2 && h.cleanups == 1)
+    }
+    case("failed cleanup stops the retry with the safety error") {
+        val h = Harness({ _, _ -> IOException("OpenLogicalChannel() failed") }, poisonOnCleanup = true)
+        check(h.open().code == "OMAPI_SESSION_CORRUPTED")
+        check(h.calls == 1 && h.cleanups == 1)
+    }
+    case("null-only channel result is not invented as access denied") {
+        val h = Harness({ _, _ -> null })
+        check(h.open().code == "CHANNEL_FAILED")
+        check(h.calls == 1 && h.cleanups == 0)
+    }
+    case("absent applet can fall back to a supported AID") {
+        val h = Harness({ aid, _ -> if (aid == first) NoSuchElementException() else Channel() })
+        check(h.open(listOf(first, second)).code == null)
+        check(h.calls == 2 && h.cleanups == 0)
+    }
+    case("no session remains NOT_CONNECTED") {
+        val h = Harness({ _, _ -> Channel() }, noSession = true)
+        check(h.open().code == "NOT_CONNECTED")
+        check(h.calls == 0)
+    }
+    case("existing channel ownership guard is preserved") {
+        val h = Harness({ _, _ -> Channel() })
+        h.readerChannels.getValue("SIM1")[first] = Channel()
+        check(h.open().code == "CHANNEL_ALREADY_OPEN")
+        check(h.calls == 0 && h.cleanups == 0)
+    }
+    println("RESULT: $passed passed, $failed failed (JVM doubles, not Android hardware)")
+    if (failed > 0) throw AssertionError("$failed tests failed")
+}
