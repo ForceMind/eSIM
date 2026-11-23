@@ -423,11 +423,15 @@ void main() {
       await tester.pumpAndSettle();
       final before = find.widgetWithText(FilledButton, 'Capture before');
       await tester.ensureVisible(before);
+      await tester.pumpAndSettle();
+      expect(before.hitTestable(), findsOneWidget);
       await tester.tap(before);
       await tester.pumpAndSettle();
       expect(find.byType(SnackBar), findsNothing);
       final copy = find.widgetWithText(OutlinedButton, 'Copy report');
       await tester.ensureVisible(copy);
+      await tester.pumpAndSettle();
+      expect(copy.hitTestable(), findsOneWidget);
       await tester.tap(copy);
       await tester.pumpAndSettle();
       expect(find.byType(SnackBar), findsNothing);
