@@ -14,9 +14,9 @@ import xml.etree.ElementTree as ET
 ROOT = Path(__file__).resolve().parent.parent
 UPSTREAM = "https://github.com/iebb/NekokoLPA2.git"
 BASELINE = "6d2145a515557941f10c5ebbf734d01f7d05fb43"
-APP_ID = "io.github.forcemind.nekokolpa.issue62.v3"
-APP_NAME = "9eSIM Test 3"
-VERSION = "2.5.0-issue62.3+3"
+APP_ID = "io.github.forcemind.nekokolpa.issue62.v4"
+APP_NAME = "9eSIM Test 4"
+VERSION = "2.5.0-issue62.4+4"
 ANDROID = "{http://schemas.android.com/apk/res/android}"
 ET.register_namespace("android", ANDROID[1:-1])
 
@@ -50,6 +50,10 @@ def main() -> None:
     patch = ROOT / "patches/issue62-v2.patch"
     run("git", "apply", "--check", str(patch), cwd=source)
     run("git", "apply", str(patch), cwd=source)
+
+    diagnostics_patch = ROOT / "patches/issue62-diagnostics.patch"
+    run("git", "apply", "--check", str(diagnostics_patch), cwd=source)
+    run("git", "apply", str(diagnostics_patch), cwd=source)
 
     gradle = source / "android/app/build.gradle.kts"
     text = replace_exact(gradle.read_text(), 'applicationId = "ee.nekoko.nlpa2.open"',
@@ -111,6 +115,8 @@ def main() -> None:
         "upstream_repository": "iebb/NekokoLPA2", "upstream_commit": BASELINE,
         "application_id": APP_ID, "application_name": APP_NAME, "version": VERSION,
         "patch_sha256": hashlib.sha256(patch.read_bytes()).hexdigest(),
+        "diagnostics_patch_sha256": hashlib.sha256(diagnostics_patch.read_bytes()).hexdigest(),
+        "diagnostics": "passive native events and read-only snapshots; no ARA-M inspection or card writes",
         "signing_key": "independent ephemeral test key plus official published 9eSIM community key",
         "signing_scheme": "APK v2 with two current signers; not signing lineage",
         "hardware_validation": "not performed",

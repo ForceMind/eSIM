@@ -20,6 +20,7 @@ test_root = Path(__file__).resolve().parent
 native = source_root / 'android/app/src/main/kotlin/ee/nekoko/nlpa2'
 plugin = native / 'OmapiPlugin.kt'
 classifier = native / 'OmapiOpenFailures.kt'
+recorder = native / 'OmapiDiagnosticsRecorder.kt'
 text = plugin.read_text()
 start = text.index('    private fun handleOpenChannel(')
 end_marker = '\n    @RequiresApi(Build.VERSION_CODES.P)\n    private fun handleCloseChannel('
@@ -27,24 +28,31 @@ end = text.index(end_marker, start)
 method = text[start:end].rstrip()
 if not method.endswith('}'):
     raise SystemExit('Cannot extract complete production method')
+session_start = text.index('    private fun getOrCreateSession(')
+session_end = text.index('\n    @RequiresApi(Build.VERSION_CODES.P)\n    private fun handleDisconnect(', session_start)
+session_method = text[session_start:session_end].rstrip()
+if not session_method.endswith('}'):
+    raise SystemExit('Cannot extract complete production session method')
 
 output.mkdir(parents=True, exist_ok=True)
 harness = (test_root / 'NativeOpenHarness.kt.in').read_text()
-if harness.count('@@METHOD@@') != 1:
-    raise SystemExit('Expected exactly one production method placeholder')
+if harness.count('@@METHOD@@') != 1 or harness.count('@@SESSION_METHOD@@') != 1:
+    raise SystemExit('Expected exactly one placeholder for each production method')
 generated = output / 'NativeOpenHarness.kt'
-generated.write_text(harness.replace('@@METHOD@@', method))
+generated.write_text(harness.replace('@@METHOD@@', method).replace('@@SESSION_METHOD@@', session_method))
 (output / 'source-provenance.json').write_text(json.dumps({
     'method_source': str(plugin.relative_to(source_root)),
     'method_sha256': hashlib.sha256(method.encode()).hexdigest(),
     'plugin_sha256': hashlib.sha256(plugin.read_bytes()).hexdigest(),
     'classifier_sha256': hashlib.sha256(classifier.read_bytes()).hexdigest(),
+    'session_method_sha256': hashlib.sha256(session_method.encode()).hexdigest(),
+    'recorder_sha256': hashlib.sha256(recorder.read_bytes()).hexdigest(),
     'scope': 'JVM doubles; not Android or real-card validation',
 }, indent=2) + '\n')
 
 jar = output / 'native-tests.jar'
 compile_result = subprocess.run(
-    ['kotlinc', str(classifier), str(generated), '-include-runtime', '-d', str(jar)],
+    ['kotlinc', str(classifier), str(recorder), str(generated), '-include-runtime', '-d', str(jar)],
     text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
 )
 (output / 'compile.log').write_text(compile_result.stdout)

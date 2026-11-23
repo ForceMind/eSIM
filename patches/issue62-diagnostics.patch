@@ -1,0 +1,1937 @@
+diff --git a/android/app/src/main/kotlin/ee/nekoko/nlpa2/OmapiDiagnostics.kt b/android/app/src/main/kotlin/ee/nekoko/nlpa2/OmapiDiagnostics.kt
+new file mode 100644
+index 0000000..360b10a
+--- /dev/null
++++ b/android/app/src/main/kotlin/ee/nekoko/nlpa2/OmapiDiagnostics.kt
+@@ -0,0 +1,243 @@
++package ee.nekoko.nlpa2
++
++import android.content.Context
++import android.content.pm.PackageManager
++import android.os.Build
++import android.telephony.SubscriptionManager
++import android.telephony.TelephonyManager
++import org.json.JSONArray
++import org.json.JSONObject
++import java.security.MessageDigest
++import java.time.Instant
++import java.util.concurrent.Executors
++import java.util.concurrent.Future
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.TimeoutException
++import java.util.concurrent.atomic.AtomicBoolean
++
++/** App-private, bounded diagnostics. No secure-element object is passed to this class. */
++internal class OmapiDiagnostics(private val context: Context) {
++    private val preferences = context.getSharedPreferences("issue62_diagnostics_v1", Context.MODE_PRIVATE)
++    private val writer = Executors.newSingleThreadScheduledExecutor { task ->
++        Thread(task, "Issue62DiagnosticWriter").apply { isDaemon = true }
++    }
++    private val savePending = AtomicBoolean(false)
++    private val metadataWorker = Executors.newSingleThreadExecutor { task ->
++        Thread(task, "Issue62TelephonyMetadata").apply { isDaemon = true }
++    }
++    private var metadataQuery: Future<Map<String, Any?>>? = null
++    @Volatile private var storageErrorClass: String? = null
++    val recorder = OmapiDiagnosticsRecorder(onChanged = { scheduleSave() })
++
++    init {
++        try {
++            val text = preferences.getString("events", null)
++            if (text != null && text.length <= MAX_STORED_CHARS) {
++                val saved = JSONObject(text)
++                val rows = saved.optJSONArray("events") ?: JSONArray()
++                val decoded = (0 until rows.length().coerceAtMost(512)).mapNotNull { index ->
++                    rows.optJSONObject(index)?.let { decodeObject(it) }
++                }
++                recorder.restore(decoded, saved.optLong("droppedEventCount", 0))
++            }
++        } catch (error: Exception) { storageErrorClass = error.javaClass.name }
++    }
++
++    private fun scheduleSave() {
++        if (!savePending.compareAndSet(false, true)) return
++        try {
++            writer.schedule({
++                savePending.set(false)
++                saveNow()
++            }, 100, TimeUnit.MILLISECONDS)
++        } catch (error: Exception) {
++            savePending.set(false)
++            storageErrorClass = error.javaClass.name
++        }
++    }
++
++    private fun saveNow() {
++        try {
++            preferences.edit().putString("events", serializedSnapshot()).apply()
++            storageErrorClass = null
++        } catch (error: Exception) { storageErrorClass = error.javaClass.name }
++    }
++
++    private fun serializedSnapshot(): String {
++        val snapshot = recorder.snapshot()
++        val rows = (snapshot["events"] as List<*>).toMutableList()
++        var dropped = (snapshot["droppedEventCount"] as Number).toLong()
++        while (true) {
++            val text = JSONObject(mapOf("events" to rows, "droppedEventCount" to dropped)).toString()
++            if (text.length <= MAX_STORED_CHARS || rows.isEmpty()) return text
++            val count = (rows.size / 8).coerceAtLeast(1)
++            repeat(count) { rows.removeAt(0) }
++            dropped += count
++        }
++    }
++
++    fun close() {
++        // Serialize the final write behind any pending write, then stop this instance's worker.
++        try { writer.execute { saveNow() }; writer.shutdown() } catch (_: Exception) { }
++        metadataWorker.shutdownNow()
++    }
++
++    fun clear(): Boolean {
++        recorder.clear()
++        // Run after previous writer tasks; commit confirms old persisted events are gone before
++        // the UI reports success. This never runs on the OMAPI hardware executor.
++        return try {
++            writer.submit<Boolean> {
++                preferences.edit().putString("events", serializedSnapshot()).commit()
++            }.get(3, TimeUnit.SECONDS)
++        } catch (error: Exception) {
++            storageErrorClass = error.javaClass.name
++            false
++        }
++    }
++
++    fun snapshot(service: Map<String, Any?>): Map<String, Any?> {
++        val recorded = recorder.snapshot()
++        return linkedMapOf(
++                "schemaVersion" to 1,
++                "generatedAtUtc" to Instant.now().toString(),
++                "app" to appInfo(),
++                "device" to mapOf(
++                        "manufacturer" to OmapiDiagnosticsRecorder.redact(Build.MANUFACTURER),
++                        "model" to OmapiDiagnosticsRecorder.redact(Build.MODEL),
++                        "sdkInt" to Build.VERSION.SDK_INT,
++                        "androidRelease" to OmapiDiagnosticsRecorder.redact(Build.VERSION.RELEASE),
++                ),
++                "service" to service,
++                "telephony" to boundedTelephonyInfo(),
++                "events" to recorded["events"],
++                "droppedEventCount" to recorded["droppedEventCount"],
++                "recording" to mapOf(
++                        "mode" to "passive_existing_operations",
++                        "eventLimit" to 512,
++                        "persistence" to "app_private_best_effort",
++                        "storageErrorClass" to storageErrorClass,
++                        "omitted" to listOf("APDU payloads", "ATR", "SELECT response", "ICCID", "EID",
++                                "IMSI", "IMEI", "phone numbers", "activation codes", "profile names"),
++                        "evidenceNote" to "Carrier privileges and OMAPI AID authorization are separate; no ARA-M rules were read.",
++                ),
++        )
++    }
++
++    @Suppress("DEPRECATION")
++    private fun appInfo(): Map<String, Any?> = try {
++        val flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES
++                else PackageManager.GET_SIGNATURES
++        val info = context.packageManager.getPackageInfo(context.packageName, flags)
++        val signatures = if (Build.VERSION.SDK_INT >= 28) info.signingInfo?.apkContentsSigners
++                else info.signatures
++        val certificates = signatures.orEmpty().map { it.toByteArray() }
++        mapOf(
++                "packageName" to context.packageName,
++                "versionName" to info.versionName,
++                "versionCode" to if (Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong(),
++                "currentSignerSha1" to certificates.map { digest(it, "SHA-1") }.distinct(),
++                "currentSignerSha256" to certificates.map { digest(it, "SHA-256") }.distinct(),
++        )
++    } catch (error: Exception) {
++        mapOf("packageName" to context.packageName, "errorClass" to error.javaClass.name,
++                "message" to OmapiDiagnosticsRecorder.redact(error.message.orEmpty()))
++    }
++
++    @Suppress("DEPRECATION")
++    private fun telephonyInfo(): Map<String, Any?> {
++        val note = "Logical slots are not mapped to OMAPI reader names. A false privilege result does not prove access-rule denial."
++        return try {
++            val manager = context.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
++                    ?: return mapOf("status" to "unavailable", "logicalSlots" to emptyList<Any>(), "mappingNote" to note)
++            val count = manager.phoneCount.coerceIn(0, 4)
++            val slots = (0 until count).map { index ->
++                val slot = linkedMapOf<String, Any?>(
++                        "logicalSlotIndex" to index,
++                        "subscriptionMappingStatus" to "unavailable",
++                        "carrierPrivilegeStatus" to "unavailable",
++                        "hasCarrierPrivileges" to null,
++                )
++                try { slot["simState"] = manager.getSimState(index) }
++                catch (error: Exception) { slot["simStateErrorClass"] = error.javaClass.name }
++                try {
++                    val subscriptionId: Int? = when {
++                        Build.VERSION.SDK_INT >= 34 -> SubscriptionManager.getSubscriptionId(index)
++                        Build.VERSION.SDK_INT >= 29 -> context.getSystemService(SubscriptionManager::class.java)
++                                ?.getSubscriptionIds(index)?.firstOrNull()
++                        else -> null
++                    }
++                    if (subscriptionId == null) {
++                        slot["subscriptionMappingStatus"] = "unavailable"
++                    } else if (!SubscriptionManager.isValidSubscriptionId(subscriptionId)) {
++                        slot["subscriptionMappingStatus"] = "no_valid_subscription"
++                    } else {
++                        slot["subscriptionId"] = subscriptionId
++                        slot["subscriptionMappingStatus"] = "mapped"
++                        // Never use the default-subscription manager for a slot with no valid mapping.
++                        val granted = manager.createForSubscriptionId(subscriptionId).hasCarrierPrivileges()
++                        slot["hasCarrierPrivileges"] = granted
++                        slot["carrierPrivilegeStatus"] = if (granted) "granted" else "not_confirmed"
++                    }
++                } catch (error: Exception) {
++                    slot["errorClass"] = error.javaClass.name
++                    slot["message"] = OmapiDiagnosticsRecorder.redact(error.message.orEmpty())
++                }
++                slot
++            }
++            mapOf(
++                    "status" to when {
++                        count == 0 -> "unavailable"
++                        slots.any { it["carrierPrivilegeStatus"] == "unavailable" } -> "partial"
++                        else -> "available"
++                    },
++                    "logicalSlots" to slots,
++                    "mappingNote" to note,
++            )
++        } catch (error: Exception) {
++            mapOf("status" to "unavailable", "logicalSlots" to emptyList<Any>(), "mappingNote" to note,
++                    "errorClass" to error.javaClass.name,
++                    "message" to OmapiDiagnosticsRecorder.redact(error.message.orEmpty()))
++        }
++    }
++
++    /** A stalled telephony Binder must not prevent exporting the already recorded OMAPI events. */
++    private fun boundedTelephonyInfo(): Map<String, Any?> {
++        fun unavailable(message: String, errorClass: String? = null): Map<String, Any?> = mapOf(
++                "status" to "unavailable", "logicalSlots" to emptyList<Any>(),
++                "mappingNote" to "Logical slots are not mapped to OMAPI reader names.",
++                "message" to message, "errorClass" to errorClass,
++        )
++        // At most one pending system-metadata query. Never accumulate more tasks behind a stuck one.
++        if (metadataQuery?.isDone == false) return unavailable("Previous read-only telephony query is still pending")
++        return try {
++            val query = metadataWorker.submit<Map<String, Any?>> { telephonyInfo() }
++            metadataQuery = query
++            query.get(2, TimeUnit.SECONDS)
++        } catch (_: TimeoutException) {
++            unavailable("Read-only telephony query exceeded two seconds", "java.util.concurrent.TimeoutException")
++        } catch (error: InterruptedException) {
++            Thread.currentThread().interrupt()
++            unavailable("Read-only telephony query was interrupted", error.javaClass.name)
++        } catch (error: Exception) {
++            unavailable("Read-only telephony metadata is unavailable", error.javaClass.name)
++        }
++    }
++
++    private fun digest(bytes: ByteArray, algorithm: String): String =
++            MessageDigest.getInstance(algorithm).digest(bytes).joinToString("") { "%02X".format(it) }
++
++    private fun decodeObject(value: JSONObject): Map<String, Any?> = value.keys().asSequence().associateWith { key ->
++        decodeValue(value.opt(key))
++    }
++
++    private fun decodeValue(value: Any?): Any? = when (value) {
++        null, JSONObject.NULL -> null
++        is JSONObject -> decodeObject(value)
++        is JSONArray -> (0 until value.length().coerceAtMost(512)).map { decodeValue(value.opt(it)) }
++        is String, is Number, is Boolean -> value
++        else -> null
++    }
++
++    companion object { private const val MAX_STORED_CHARS = 2_000_000 }
++}
+diff --git a/android/app/src/main/kotlin/ee/nekoko/nlpa2/OmapiDiagnosticsRecorder.kt b/android/app/src/main/kotlin/ee/nekoko/nlpa2/OmapiDiagnosticsRecorder.kt
+new file mode 100644
+index 0000000..0f6ac8c
+--- /dev/null
++++ b/android/app/src/main/kotlin/ee/nekoko/nlpa2/OmapiDiagnosticsRecorder.kt
+@@ -0,0 +1,146 @@
++package ee.nekoko.nlpa2
++
++import java.time.Instant
++import java.util.ArrayDeque
++import java.util.Collections
++import java.util.IdentityHashMap
++
++/** Structured diagnostic data only. Never accepts APDU or profile payloads. */
++internal class OmapiDiagnosticsRecorder(
++        private val capacity: Int = 512,
++        private val clock: () -> String = { Instant.now().toString() },
++        private val onChanged: () -> Unit = {},
++) {
++    private val events = ArrayDeque<Map<String, Any?>>()
++    private var dropped = 0L
++
++    init { require(capacity in 1..512) }
++
++    fun record(
++            stage: String,
++            outcome: String,
++            reader: String? = null,
++            aid: String? = null,
++            retry: Int? = null,
++            error: Throwable? = null,
++            code: String? = null,
++            message: String? = null,
++            statusWord: String? = null,
++    ) {
++        val event = linkedMapOf<String, Any?>(
++                "timestampUtc" to clock(),
++                "stage" to safeLabel(stage),
++                "outcome" to safeLabel(outcome),
++        )
++        reader?.let { event["reader"] = safeReader(it) }
++        aid?.let { event["aid"] = safeAid(it) }
++        retry?.let { event["retry"] = it.coerceIn(0, 100) }
++        code?.let { event["code"] = safeLabel(it) }
++        message?.let { event["message"] = redact(it) }
++        statusWord?.takeIf { it.matches(Regex("[0-9a-fA-F]{4}")) }?.let {
++            event["statusWord"] = it.uppercase()
++        }
++        error?.let {
++            event["errorClass"] = safeClass(it.javaClass.name)
++            event["message"] = redact(it.message.orEmpty())
++            val causes = mutableListOf<Map<String, String>>()
++            val seen = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())
++            seen.add(it)
++            var cause = it.cause
++            while (cause != null && causes.size < 4 && seen.add(cause)) {
++                causes.add(mapOf("errorClass" to safeClass(cause.javaClass.name),
++                        "message" to redact(cause.message.orEmpty())))
++                cause = cause.cause
++            }
++            if (causes.isNotEmpty()) event["causeChain"] = causes
++        }
++        synchronized(this) {
++            if (events.size == capacity) { events.removeFirst(); dropped++ }
++            events.addLast(event)
++        }
++        try { onChanged() } catch (_: Exception) { /* Diagnostics cannot break card operations. */ }
++    }
++
++    @Synchronized
++    fun snapshot(): Map<String, Any?> = mapOf(
++            "events" to events.map { copyEvent(it) },
++            "droppedEventCount" to dropped,
++    )
++
++    fun clear() {
++        synchronized(this) { events.clear(); dropped = 0 }
++        try { onChanged() } catch (_: Exception) { }
++    }
++
++    /** Restore only this schema's bounded, re-sanitized fields from private storage. */
++    @Synchronized
++    fun restore(saved: List<Map<String, Any?>>, savedDropped: Long) {
++        events.clear()
++        dropped = savedDropped.coerceAtLeast(0) + (saved.size - capacity).coerceAtLeast(0)
++        for (raw in saved.takeLast(capacity)) {
++            val timestamp = (raw["timestampUtc"] as? String)
++                    ?.takeIf { it.length <= 40 && it.matches(Regex("[0-9TZ:.+\\-]+")) }
++                    ?: clock()
++            val clean = linkedMapOf<String, Any?>(
++                    "timestampUtc" to timestamp,
++                    "stage" to safeLabel(raw["stage"] as? String ?: "restored"),
++                    "outcome" to safeLabel(raw["outcome"] as? String ?: "unknown"),
++            )
++            (raw["reader"] as? String)?.let { clean["reader"] = safeReader(it) }
++            (raw["aid"] as? String)?.let { clean["aid"] = safeAid(it) }
++            (raw["retry"] as? Number)?.let { clean["retry"] = it.toInt().coerceIn(0, 100) }
++            (raw["code"] as? String)?.let { clean["code"] = safeLabel(it) }
++            (raw["statusWord"] as? String)?.takeIf { it.matches(Regex("[0-9A-Fa-f]{4}")) }
++                    ?.let { clean["statusWord"] = it.uppercase() }
++            (raw["message"] as? String)?.let { clean["message"] = redact(it) }
++            (raw["errorClass"] as? String)?.let { clean["errorClass"] = safeClass(it) }
++            (raw["causeChain"] as? List<*>)?.take(4)?.mapNotNull { cause ->
++                val item = cause as? Map<*, *> ?: return@mapNotNull null
++                mapOf("errorClass" to safeClass(item["errorClass"] as? String ?: "unknown"),
++                        "message" to redact(item["message"] as? String ?: ""))
++            }?.takeIf { it.isNotEmpty() }?.let { clean["causeChain"] = it }
++            events.addLast(clean)
++        }
++    }
++
++    private fun copyEvent(event: Map<String, Any?>): Map<String, Any?> = event.toMutableMap().also { copy ->
++        (event["causeChain"] as? List<*>)?.let { causes ->
++            copy["causeChain"] = causes.map { (it as Map<*, *>).toMap() }
++        }
++    }
++
++    companion object {
++        private val namedIdentifier = Regex("""(?i)["']?\b(?:iccid|eid|imsi|imei|msisdn|euiccId|cardId|subscriberId|profileName|serial(?:number|no)?|phone(?:[ _-]?number)?|activation(?:[ _-]?(?:code|token))?|matching(?:[ _-]?id)?|confirmation(?:[ _-]?code)?|token|pin[12]?|puk[12]?|password|passwd|smdp\+?)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)""")
++        private val payload = Regex("""(?i)["']?\b(?:apdu|atr|selectResponse|command(?:Data)?|response(?:Data)?)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|\[[^\]]*\]|(?:0x)?(?:[0-9a-f]{2}[\s:,-]*){1,})""")
++        private val activation = Regex("""(?i)\bLPA:[^\s]+""")
++        private val url = Regex("""(?i)\b(?:https?|smdp)://[^\s]+""")
++        private val email = Regex("""[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}""")
++        private val hexBytes = Regex("""(?i)\b(?:[0-9a-f]{2}[\s:,\-]+){7,}[0-9a-f]{2}\b""")
++        private val longHex = Regex("""(?i)\b[0-9a-f]{16,}\b""")
++        private val digits = Regex("""(?<![A-Za-z0-9])\+?\d[\d .()\-]{7,}\d(?![A-Za-z0-9])""")
++        private val longToken = Regex("""\b[A-Za-z0-9_\-]{32,}\b""")
++        private val controls = Regex("[\\p{Cntrl}&&[^\\n\\t]]")
++
++        fun redact(value: String): String {
++            // Bound work before applying regexes. Truncation never re-exposes a removed identifier.
++            var text = value.take(8192)
++            for (pattern in listOf(activation, url, email, payload, namedIdentifier, hexBytes, longHex, digits, longToken)) {
++                text = pattern.replace(text, "[redacted]")
++            }
++            return controls.replace(text, " ").take(512)
++        }
++
++        fun safeReader(value: String): String =
++                value.takeIf { it.matches(Regex("SIM[0-9A-Za-z._-]{0,28}")) } ?: "[other_reader]"
++
++        fun safeAid(value: String): String =
++                value.uppercase().takeIf { it.length % 2 == 0 && it.matches(Regex("[0-9A-F]{10,32}")) }
++                        ?: "[invalid_aid]"
++
++        private fun safeLabel(value: String): String =
++                value.takeIf { it.matches(Regex("[A-Za-z0-9_.:-]{1,80}")) } ?: "unknown"
++
++        private fun safeClass(value: String): String =
++                value.takeIf { it.matches(Regex("[A-Za-z0-9_.$]{1,180}")) } ?: "unknown"
++    }
++}
+diff --git a/android/app/src/main/kotlin/ee/nekoko/nlpa2/OmapiPlugin.kt b/android/app/src/main/kotlin/ee/nekoko/nlpa2/OmapiPlugin.kt
+index d3b2d56..ae9f1b8 100644
+--- a/android/app/src/main/kotlin/ee/nekoko/nlpa2/OmapiPlugin.kt
++++ b/android/app/src/main/kotlin/ee/nekoko/nlpa2/OmapiPlugin.kt
+@@ -36,8 +36,12 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+     private var eventChannel: EventChannel? = null
+     private var eventSink: EventChannel.EventSink? = null
+     private var context: Context? = null
+-    private var seService: SEService? = null
++    @Volatile private var seService: SEService? = null
+     private var serviceReadiness: OmapiServiceReadiness? = null
++    private var diagnostics: OmapiDiagnostics? = null
++    private var diagnosticExecutor: java.util.concurrent.ExecutorService? = null
++    @Volatile private var diagnosticConnectedLastObserved: Boolean? = null
++    private val diagnosticReaderPresence = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+ 
+     // Track open sessions and channels per reader - using thread-safe maps
+     private val readerSessions = java.util.concurrent.ConcurrentHashMap<String, Session>()
+@@ -117,6 +121,7 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+                     val action = intent?.action ?: return
+                     if (action == "android.intent.action.SIM_STATE_CHANGED") {
+                         val state = intent.getStringExtra("ss") ?: ""
++                        diagnosticEvent("sim_state_changed", "observed", message = state)
+                         Log.d(TAG, "SIM state changed: $state")
+                         lifecycleCoordinator?.enqueueHardware(
+                                 onRejected = {},
+@@ -164,8 +169,14 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+         // Restore reboot-required state before registering any callable hardware entry point.
+         val appContext = binding.applicationContext
+         context = appContext
++        diagnostics = try { OmapiDiagnostics(appContext) } catch (_: Exception) { null }
++        diagnosticExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { task ->
++            Thread(task, "Issue62DiagnosticReader").apply { isDaemon = true }
++        }
++        diagnosticEvent("engine", "attached")
+         cleanupCoordinator = createCleanupCoordinator(appContext)
+         cleanupCoordinator.poisonInfo?.let {
++            diagnosticEvent("guard", "restored_poison", reader = it.readerName, message = it.reason)
+             Log.e(TAG, "Persisted OMAPI poison restored; hardware access remains blocked until reboot")
+         }
+ 
+@@ -210,12 +221,14 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+                             shutdownServiceAfterCleanup("engine detach")
+                         }
+                     } finally {
++                        shutdownDiagnosticWorkers()
+                         stopBackgroundThread()
+                         context = null
+                     }
+                 } == true
+         if (!queued) {
+             Log.e(TAG, "Unable to queue OMAPI engine-detach cleanup; durable guard remains armed")
++            shutdownDiagnosticWorkers()
+             stopBackgroundThread()
+             context = null
+         }
+@@ -289,12 +302,16 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+         serviceReadiness = readiness
+         seService =
+                 SEService(appContext, { obj: Runnable -> obj.run() }) {
++                    diagnosticConnectedLastObserved = true
++                    diagnosticEvent("service", "connected")
+                     Log.d(TAG, "SE service connected")
+                     sendEvent(mapOf("type" to "se_service_connected"))
+                     readiness.onConnected()
+                 }
+ 
+         if (wait && !readiness.awaitConnected({ seService?.isConnected == true })) {
++            diagnosticConnectedLastObserved = false
++            diagnosticEvent("service", "connection_timeout")
+             Log.w(TAG, "Timeout waiting for SE service connection")
+         }
+         return true
+@@ -320,6 +337,8 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+         try {
+             seService?.shutdown()
+             seService = null
++            diagnosticConnectedLastObserved = false
++            diagnosticEvent("service", "shutdown")
+         } catch (e: Exception) {
+             cleanupCoordinator.markPoisoned(
+                     readerName = null,
+@@ -342,8 +361,109 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+         eventSink?.success(event)
+     }
+ 
++    private fun shutdownDiagnosticWorkers() {
++        try { diagnostics?.close() } catch (_: Exception) { }
++        diagnosticExecutor?.shutdown()
++        diagnosticExecutor = null
++    }
++
++    private fun diagnosticEvent(
++            stage: String,
++            outcome: String,
++            reader: String? = null,
++            aid: String? = null,
++            retry: Int? = null,
++            error: Throwable? = null,
++            code: String? = null,
++            message: String? = null,
++            statusWord: String? = null,
++    ) {
++        try { diagnostics?.recorder?.record(stage, outcome, reader, aid, retry, error, code, message, statusWord) }
++        catch (_: Exception) { /* Diagnostics must not change card behavior. */ }
++    }
++
++    /** A snapshot of software caches only: no Reader/Session/SEService method may be called here. */
++    private fun diagnosticServiceState(): Map<String, Any?> {
++        val poison = if (::cleanupCoordinator.isInitialized) cleanupCoordinator.poisonInfo else null
++        val names = (diagnosticReaderPresence.keys + readerStatusCache.keys + readerSessions.keys +
++                readerChannels.keys + readersWithSuccessfulChannel).toSet().sorted()
++        return mapOf(
++                "initialized" to (seService != null),
++                "connectedLastObserved" to diagnosticConnectedLastObserved,
++                "profileSwitchInProgress" to profileSwitchInProgress,
++                "poisoned" to (poison != null),
++                "poisonReason" to poison?.reason?.let { OmapiDiagnosticsRecorder.redact(it) },
++                "readers" to names.map { name ->
++                    mapOf(
++                            "reader" to OmapiDiagnosticsRecorder.safeReader(name),
++                            "statusCached" to readerStatusCache[name]?.let { OmapiDiagnosticsRecorder.redact(it) },
++                            "secureElementPresentLastObserved" to diagnosticReaderPresence[name],
++                            "hasSession" to readerSessions.containsKey(name),
++                            "openChannelCount" to (readerChannels[name]?.size ?: 0),
++                            "successfulChannelPreviouslyOpened" to readersWithSuccessfulChannel.contains(name),
++                    )
++                },
++        )
++    }
++
++    private fun handleDiagnosticCall(call: MethodCall, result: Result) {
++        val recorder = diagnostics
++        val executor = diagnosticExecutor
++        if (recorder == null || executor == null) {
++            result.error("DIAGNOSTICS_UNAVAILABLE", "Diagnostic recorder is unavailable", null)
++            return
++        }
++        val marker = call.argument<String>("marker")
++        if (marker != null && marker !in setOf("before_switch", "after_switch", "manual")) {
++            result.error("INVALID_ARGUMENT", "Unknown diagnostic marker", null)
++            return
++        }
++        try {
++            executor.execute {
++                try {
++                    if (call.method == "clearDiagnostics") {
++                        val cleared = recorder.clear()
++                        runOnUiThread {
++                            if (cleared) result.success(true)
++                            else result.error("DIAGNOSTICS_CLEAR_FAILED", "Could not confirm clearing diagnostic storage", null)
++                        }
++                    } else {
++                        marker?.let { diagnosticEvent("marker", it) }
++                        val snapshot = recorder.snapshot(diagnosticServiceState())
++                        runOnUiThread { result.success(snapshot) }
++                    }
++                } catch (error: Exception) {
++                    diagnosticEvent("diagnostics", "snapshot_error", error = error)
++                    runOnUiThread { result.error("DIAGNOSTICS_FAILED", "Cannot collect diagnostic snapshot", null) }
++                }
++            }
++        } catch (_: java.util.concurrent.RejectedExecutionException) {
++            result.error("DIAGNOSTICS_UNAVAILABLE", "Diagnostic recorder is stopping", null)
++        }
++    }
++
++    /** Observe final error codes without serializing call arguments, success payloads or details. */
++    private fun diagnosticResult(method: String, delegate: Result): Result = object : Result {
++        override fun success(value: Any?) {
++            if (method != "transmit" && method != "transmitOnChannel") diagnosticEvent("method.$method", "success")
++            delegate.success(value)
++        }
++        override fun error(code: String, message: String?, details: Any?) {
++            diagnosticEvent("method.$method", "error", code = code, message = message)
++            delegate.error(code, message, details)
++        }
++        override fun notImplemented() { delegate.notImplemented() }
++    }
++
+     @RequiresApi(Build.VERSION_CODES.P)
+-    override fun onMethodCall(call: MethodCall, result: Result) {
++    override fun onMethodCall(call: MethodCall, rawResult: Result) {
++        // Available even when OMAPI is poisoned or its backend is blocked. These branches only
++        // access app-private diagnostics, software caches and read-only Android system metadata.
++        if (call.method == "getDiagnostics" || call.method == "clearDiagnostics") {
++            handleDiagnosticCall(call, rawResult)
++            return
++        }
++        val result = diagnosticResult(call.method, rawResult)
+         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+             result.error("UNSUPPORTED", "OMAPI requires Android 9.0 or higher", null)
+             return
+@@ -351,6 +471,7 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+ 
+         if (call.method == "setProfileSwitchInProgress") {
+             profileSwitchInProgress = call.argument<Boolean>("value") == true
++            diagnosticEvent("profile_switch", if (profileSwitchInProgress) "started" else "finished")
+             if (!profileSwitchInProgress) {
+                 lifecycleCoordinator?.enqueueHardware(onRejected = {}, operation = { checkpointCleanIdle() })
+             }
+@@ -414,6 +535,7 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+                                     }
+                                     checkpointCleanIdle()
+                                 } catch (e: Exception) {
++                                    diagnosticEvent("method.${call.method}", "uncaught_exception", error = e)
+                                     Log.e(TAG, "Error in background method: ${call.method}", e)
+                                     runOnUiThread { result.error("ERROR", e.message, null) }
+                                 }
+@@ -441,6 +563,7 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+             entry: OmapiHardwareEntry,
+     ): Boolean {
+         val info = cleanupCoordinator.rejectionForHardwareEntry(entry) ?: return false
++        diagnosticEvent("guard", "blocked", reader = info.readerName, message = info.reason)
+         runOnUiThread {
+             result.error(
+                     OMAPI_SESSION_CORRUPTED,
+@@ -456,6 +579,7 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+             entry: OmapiHardwareEntry = OmapiHardwareEntry.OPEN_SESSION,
+     ): Boolean {
+         val info = cleanupCoordinator.enterHardware(entry) ?: return false
++        diagnosticEvent("guard", "blocked", reader = info.readerName, message = info.reason)
+         runOnUiThread {
+             result.error(
+                     OMAPI_SESSION_CORRUPTED,
+@@ -477,6 +601,7 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+ 
+     private fun reportCleanupFailure(result: Result, cleanup: OmapiCleanupResult): Boolean {
+         if (cleanup !is OmapiCleanupResult.RebootRequired) return false
++        diagnosticEvent("cleanup", "failed", reader = cleanup.info.readerName, message = cleanup.info.reason)
+         runOnUiThread {
+             result.error(
+                     OMAPI_SESSION_CORRUPTED,
+@@ -533,6 +658,7 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+             channelKey: String,
+             error: Exception,
+     ) {
++        diagnosticEvent("transmit", "exception", reader = readerName, aid = channelKey, error = error)
+         if (profileSwitchInProgress) {
+             val info =
+                     cleanupCoordinator.markPoisoned(
+@@ -561,15 +687,19 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+         if (rejectIfPoisoned(result)) return
+         val readiness = serviceReadiness
+         if (seService == null || readiness?.awaitConnected({ seService?.isConnected == true }) != true) {
++            diagnosticConnectedLastObserved = false
+             runOnUiThread { result.error("NOT_CONNECTED", "SE Service not connected", null) }
+             return
+         }
++        diagnosticConnectedLastObserved = true
+ 
+         val currentTime = System.currentTimeMillis()
+         val allReaders = seService!!.readers.filter { it.name.startsWith("SIM") }
++        diagnosticEvent("listReaders", "observed", message = "SIM reader count=${allReaders.size}")
+ 
+         // Only re-probe if the list of readers changed or 10 seconds have passed since last probe
+         val currentNames = allReaders.map { it.name }.toSet()
++        diagnosticReaderPresence.keys.retainAll(currentNames)
+         val cachedNames = readerStatusCache.keys
+ 
+         if (currentNames != cachedNames || currentTime - lastScanTime > 10000) {
+@@ -581,7 +711,10 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+                             if (cleanupCoordinator.poisonInfo != null) {
+                                 throw IllegalStateException(OMAPI_SESSION_CORRUPTED)
+                             }
+-                            if (!reader.isSecureElementPresent) {
++                            val present = reader.isSecureElementPresent
++                            diagnosticReaderPresence[reader.name] = present
++                            diagnosticEvent("reader_presence", if (present) "present" else "absent", reader = reader.name)
++                            if (!present) {
+                                 reader.name to "No SIM card|Card not detected in slot"
+                             } else {
+                                 reader.name to null
+@@ -601,6 +734,7 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+                     return
+                 }
+                 Log.e(TAG, "Background probing failed", e)
++                diagnosticEvent("listReaders", "probe_exception", error = e)
+                 runOnUiThread { result.success(allReaders.map { it.name }) }
+             }
+         } else {
+@@ -635,8 +769,10 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+         val readerName = normalizeReaderName(rawReaderName)
+ 
+         if (seService == null || !seService!!.isConnected) {
++            diagnosticConnectedLastObserved = false
+             return runOnUiThread { result.error("NOT_CONNECTED", "SE Service not connected", null) }
+         }
++        diagnosticConnectedLastObserved = true
+ 
+         if (!readerName.startsWith("SIM")) {
+             return runOnUiThread {
+@@ -656,7 +792,9 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+             if (reportCleanupFailure(result, cleanup)) return
+ 
+             // Open basic session
++            diagnosticEvent("connect.openSession", "attempt", reader = readerName)
+             val session = reader.openSession()
++            diagnosticEvent("connect.openSession", "success", reader = readerName)
+             readerSessions[readerName] = session
+             readerChannels[readerName] = java.util.concurrent.ConcurrentHashMap()
+ 
+@@ -666,12 +804,14 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+             val responseMap = mapOf("success" to true, "atr" to atr)
+             runOnUiThread { result.success(responseMap) }
+         } catch (e: SecurityException) {
++            diagnosticEvent("connect.openSession", "exception", reader = readerName, error = e)
+             Log.e(TAG, "Security exception connecting to reader: $readerName", e)
+             runOnUiThread {
+                 result.error("SECURITY_EXCEPTION", "Access denied by ARA-M: ${e.message}", null)
+             }
+         } catch (e: Exception) {
+             Log.e(TAG, "Failed to connect to reader: $readerName", e)
++            diagnosticEvent("connect.openSession", "exception", reader = readerName, error = e)
+             runOnUiThread { result.error("CONNECTION_FAILED", e.message, null) }
+         }
+     }
+@@ -682,24 +822,31 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+         val normalizedReaderName = normalizeReaderName(readerName)
+         val existingSession = readerSessions[normalizedReaderName]
+         if (existingSession != null) {
++            diagnosticEvent("session", "reused", reader = normalizedReaderName)
+             return existingSession
+         }
+ 
+         Log.i(TAG, "No session for reader $normalizedReaderName, attempting to open new session...")
+         val service = seService
+         if (service == null || !service.isConnected) {
++            diagnosticConnectedLastObserved = false
++            diagnosticEvent("session", "service_unavailable", reader = normalizedReaderName)
+             Log.e(TAG, "SE Service not connected")
+             return null
+         }
++        diagnosticConnectedLastObserved = true
+ 
+         val reader = service.readers.firstOrNull { it.name == normalizedReaderName }
+         if (reader == null) {
++            diagnosticEvent("session", "reader_not_found", reader = normalizedReaderName)
+             Log.e(TAG, "Reader $normalizedReaderName not found")
+             return null
+         }
+ 
+         return try {
++            diagnosticEvent("session.open", "attempt", reader = normalizedReaderName)
+             val newSession = reader.openSession()
++            diagnosticEvent("session.open", "success", reader = normalizedReaderName)
+             readerSessions[normalizedReaderName] = newSession
+             if (readerChannels[normalizedReaderName] == null) {
+                 readerChannels[normalizedReaderName] = java.util.concurrent.ConcurrentHashMap()
+@@ -707,6 +854,7 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+             newSession
+         } catch (e: Exception) {
+             Log.e(TAG, "Failed to open session for reader $normalizedReaderName", e)
++            diagnosticEvent("session.open", "exception", reader = normalizedReaderName, error = e)
+             null
+         }
+     }
+@@ -735,6 +883,8 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+         try {
+             seService?.shutdown()
+             seService = null
++            diagnosticConnectedLastObserved = false
++            diagnosticEvent("service", "reset_shutdown")
+         } catch (e: Exception) {
+             val info =
+                     cleanupCoordinator.markPoisoned(
+@@ -777,15 +927,18 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+                             result.error("NOT_CONNECTED", "No session for reader $readerName", null)
+                         }
+ 
++        var diagnosticPhase = "openChannel.transmit"
+         try {
+             val apduBytes = hexStringToByteArray(apduHex)
+ 
+             // OMAPI requires logical channel, open with default eUICC AID
+             val aidBytes = hexStringToByteArray(DEFAULT_EUICC_AID)
+             val currentSession = readerSessions[readerName] ?: session
++            diagnosticEvent(diagnosticPhase, "attempt", reader = readerName, aid = DEFAULT_EUICC_AID)
+             val channel =
+                     currentSession.openLogicalChannel(aidBytes)
+                             ?: return runOnUiThread {
++                                diagnosticEvent(diagnosticPhase, "null_channel", reader = readerName, aid = DEFAULT_EUICC_AID)
+                                 result.error(
+                                         "CHANNEL_FAILED",
+                                         "Failed to open logical channel",
+@@ -796,10 +949,16 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+             // Never overwrite a previously tracked channel. If this newly opened duplicate cannot
+             // be closed individually, fail closed instead of losing the old channel reference.
+             if (!trackNewChannelOrReject(readerName, DEFAULT_EUICC_AID, channel, result)) return
++            diagnosticEvent(diagnosticPhase, "success", reader = readerName, aid = DEFAULT_EUICC_AID)
++            diagnosticPhase = "transmit"
+ 
+             // Android OMAPI automatically handles CLA byte modification for logical channels.
+             val response = channel.transmit(apduBytes)
+             val responseHex = response.toHex()
++            if (responseHex.length >= 4 && !responseHex.endsWith("9000", ignoreCase = true)) {
++                diagnosticEvent("transmit.status", "observed", reader = readerName,
++                        aid = DEFAULT_EUICC_AID, statusWord = responseHex.takeLast(4))
++            }
+             if (profileSwitchInProgress && responseHex.endsWith("6f00", ignoreCase = true)) {
+                 val info =
+                         cleanupCoordinator.markPoisoned(
+@@ -832,6 +991,7 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+             runOnUiThread { result.success(responseHex) }
+         } catch (e: Exception) {
+             Log.e(TAG, "Transmit failed", e)
++            diagnosticEvent(diagnosticPhase, "exception", reader = readerName, aid = DEFAULT_EUICC_AID, error = e)
+             reportTransmitException(result, readerName, DEFAULT_EUICC_AID, e)
+         }
+     }
+@@ -879,12 +1039,14 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+             try {
+                 val aidBytes = hexStringToByteArray(targetAid)
+                 val currentSession = session
++                diagnosticEvent("openChannel", "attempt", reader = readerName, aid = targetAid, retry = if (isRetry) 1 else 0)
+                 val channel = currentSession.openLogicalChannel(aidBytes)
+ 
+                 if (channel != null) {
+                     // Success. Registration is fail-closed: never overwrite an older channel.
+                     if (!trackNewChannelOrReject(readerName, targetAid, channel, result)) return
+                     readersWithSuccessfulChannel.add(readerName)
++                    diagnosticEvent("openChannel", "success", reader = readerName, aid = targetAid, retry = if (isRetry) 1 else 0)
+ 
+                     Log.i(TAG, "Opened logical channel for AID: $targetAid on reader: $readerName")
+ 
+@@ -894,8 +1056,11 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+                     runOnUiThread { result.success(responseMap) }
+                     return
+                 }
++                diagnosticEvent("openChannel", "null_channel", reader = readerName, aid = targetAid, retry = if (isRetry) 1 else 0)
+                 failures.record(null)
+             } catch (e: Exception) {
++                diagnosticEvent("openChannel", "exception", reader = readerName, aid = targetAid,
++                        retry = if (isRetry) 1 else 0, error = e)
+                 failures.record(e)
+                 // A denied candidate does not rule out another permitted AID.
+                 if (e is SecurityException) {
+@@ -907,6 +1072,8 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+         // No candidate opened. Preserve permission failures instead of collapsing
+         // them to CHANNEL_FAILED or treating them as a stale-session condition.
+         if (failures.permissionDenied) {
++            diagnosticEvent("openChannel.aggregate", "permission_failure", reader = readerName,
++                    retry = if (isRetry) 1 else 0, code = "SECURITY_EXCEPTION")
+             return runOnUiThread {
+                 result.error(
+                         "SECURITY_EXCEPTION",
+@@ -942,21 +1109,26 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+                 val cleanup = cleanupReaderSessions(readerName)
+                 if (reportCleanupFailure(result, cleanup)) return
+                 try {
++                    diagnosticEvent("openChannel.retry", "session_attempt", reader = readerName, retry = 1)
+                     // Small delay before retry
+                     Thread.sleep(150)
+                     val reader = seService!!.readers.firstOrNull { it.name == readerName }
+                     if (reader != null) {
+                         val newSession = reader.openSession()
++                        diagnosticEvent("openChannel.retry", "session_success", reader = readerName, retry = 1)
+                         readerSessions[readerName] = newSession
+                         readerChannels[readerName] = java.util.concurrent.ConcurrentHashMap()
+                         handleOpenChannel(call, result, true)
+                         return
+                     }
+                 } catch (retryEx: Exception) {
++                    diagnosticEvent("openChannel.retry", "session_exception", reader = readerName, retry = 1, error = retryEx)
+                     Log.e(TAG, "Session re-open failed during retry", retryEx)
+                 }
+             }
+         }
++        diagnosticEvent("openChannel.aggregate", "channel_failure", reader = readerName,
++                retry = if (isRetry) 1 else 0, code = "CHANNEL_FAILED", error = lastError)
+         runOnUiThread {
+             result.error(
+                     "CHANNEL_FAILED",
+@@ -1045,7 +1217,10 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+                         val session = getOrCreateSession(readerName)
+                         if (session != null) {
+                             val aidBytes = hexStringToByteArray(aidHex)
++                            diagnosticEvent("openChannel.transmit_retry", "attempt", reader = readerName, aid = aidHex, retry = attempt)
+                             channel = session.openLogicalChannel(aidBytes)
++                            diagnosticEvent("openChannel.transmit_retry", if (channel == null) "null_channel" else "success",
++                                    reader = readerName, aid = aidHex, retry = attempt)
+                             if (channel != null) {
+                                 if (!trackNewChannelOrReject(readerName, aidHex, channel, result)) {
+                                     return
+@@ -1054,6 +1229,8 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+                             }
+                         }
+                     } catch (e: Exception) {
++                        diagnosticEvent("openChannel.transmit_retry", "exception", reader = readerName,
++                                aid = aidHex, retry = attempt, error = e)
+                         Log.e(TAG, "Failed to re-open channel for $aidHex during retry $attempt", e)
+                     }
+                 } else {
+@@ -1072,6 +1249,10 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+                     Log.i(TAG, "[$readerName] >> $apduHex")
+                     val response = channel.transmit(apduBytes)
+                     val responseHex = response.toHex()
++                    if (responseHex.length >= 4 && !responseHex.endsWith("9000", ignoreCase = true)) {
++                        diagnosticEvent("transmit.status", "observed", reader = readerName, aid = aidHex,
++                                retry = attempt, statusWord = responseHex.takeLast(4))
++                    }
+                     Log.i(TAG, "[$readerName] << $responseHex")
+ 
+                     // Check for retryable status codes:
+@@ -1181,6 +1362,9 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+         // Sessions and channels are keyed by the normalized name.
+         val normalizedReaderName = normalizeReaderName(readerName)
+         val result = cleanupCoordinator.cleanupReader(normalizedReaderName)
++        diagnosticEvent("cleanup.reader", if (result is OmapiCleanupResult.RebootRequired) "failed" else "success",
++                reader = normalizedReaderName,
++                message = (result as? OmapiCleanupResult.RebootRequired)?.info?.reason)
+         if (result is OmapiCleanupResult.RebootRequired) {
+             Log.e(
+                     TAG,
+@@ -1190,5 +1374,10 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+         return result
+     }
+ 
+-    private fun cleanupAllSessions(): OmapiCleanupResult = cleanupCoordinator.cleanupAll()
++    private fun cleanupAllSessions(): OmapiCleanupResult {
++        val result = cleanupCoordinator.cleanupAll()
++        diagnosticEvent("cleanup.all", if (result is OmapiCleanupResult.RebootRequired) "failed" else "success",
++                message = (result as? OmapiCleanupResult.RebootRequired)?.info?.reason)
++        return result
++    }
+ }
+diff --git a/l10n/app_en.arb b/l10n/app_en.arb
+index 4c5771d..0f6dedd 100644
+--- a/l10n/app_en.arb
++++ b/l10n/app_en.arb
+@@ -267,7 +267,7 @@
+   "supportedDevices": "Supported Devices",
+   "aboutAram": "About ARA-M",
+   "accessDenied": "Access Denied",
+-  "accessDeniedSubtitle": "Carrier privileges are required to access this eUICC. The card's ARA-M allowlist does not match the app's signature.",
++  "accessDeniedSubtitle": "Access to the management channel was denied. The cause has not been confirmed. Save a report in Settings → 9eSIM diagnostics.",
+   "noCardDetectedSubtitle": "No unsupported or active eUICC found in this slot.",
+   "noProfilesInstalled": "No profiles installed",
+   "noProfilesInstalledSubtitle": "This eUICC card is empty.",
+diff --git a/l10n/app_zh-TW.arb b/l10n/app_zh-TW.arb
+index a6d82d8..c2bc1f3 100644
+--- a/l10n/app_zh-TW.arb
++++ b/l10n/app_zh-TW.arb
+@@ -267,7 +267,7 @@
+   "supportedDevices": "支援的設備",
+   "aboutAram": "關於 ARA-M",
+   "accessDenied": "存取被拒絕",
+-  "accessDeniedSubtitle": "存取此 eUICC 需要營運商權限。該卡片的 ARA-M 允許列表與此應用程式的簽章不符。",
++  "accessDeniedSubtitle": "管理通道存取被拒絕，具體原因尚未確認。請在「設定 → 9eSIM 診斷」中儲存報告。",
+   "noCardDetectedSubtitle": "在此插槽中未找到不支援或活動的 eUICC。",
+   "noProfilesInstalled": "未安裝任何設定檔",
+   "noProfilesInstalledSubtitle": "此 eUICC 卡片是空的。",
+diff --git a/l10n/app_zh.arb b/l10n/app_zh.arb
+index 4514b1c..820cfe0 100644
+--- a/l10n/app_zh.arb
++++ b/l10n/app_zh.arb
+@@ -267,7 +267,7 @@
+   "supportedDevices": "支持的设备",
+   "aboutAram": "关于 ARA-M",
+   "accessDenied": "访问被拒绝",
+-  "accessDeniedSubtitle": "访问此 eUICC 需要运营商权限。该卡的 ARA-M 允许列表与此应用的签名不匹配。",
++  "accessDeniedSubtitle": "管理通道访问被拒绝，具体原因尚未确认。请在“设置 → 9eSIM 诊断”中保存报告。",
+   "noCardDetectedSubtitle": "在此插槽中未找到不支持或活动的 eUICC。",
+   "noProfilesInstalled": "未安装任何配置",
+   "noProfilesInstalledSubtitle": "此 eUICC 卡是空的。",
+diff --git a/lib/l10n/app_localizations_en.dart b/lib/l10n/app_localizations_en.dart
+index 3521bd3..c048d13 100644
+--- a/lib/l10n/app_localizations_en.dart
++++ b/lib/l10n/app_localizations_en.dart
+@@ -862,7 +862,7 @@ class AppLocalizationsEn extends AppLocalizations {
+ 
+   @override
+   String get accessDeniedSubtitle =>
+-      'Carrier privileges are required to access this eUICC. The card\'s ARA-M allowlist does not match the app\'s signature.';
++      'Access to the management channel was denied. The cause has not been confirmed. Save a report in Settings → 9eSIM diagnostics.';
+ 
+   @override
+   String get noCardDetectedSubtitle =>
+diff --git a/lib/l10n/app_localizations_zh.dart b/lib/l10n/app_localizations_zh.dart
+index f794c0b..b673861 100644
+--- a/lib/l10n/app_localizations_zh.dart
++++ b/lib/l10n/app_localizations_zh.dart
+@@ -812,7 +812,7 @@ class AppLocalizationsZh extends AppLocalizations {
+ 
+   @override
+   String get accessDeniedSubtitle =>
+-      '访问此 eUICC 需要运营商权限。该卡的 ARA-M 允许列表与此应用的签名不匹配。';
++      '管理通道访问被拒绝，具体原因尚未确认。请在“设置 → 9eSIM 诊断”中保存报告。';
+ 
+   @override
+   String get noCardDetectedSubtitle => '在此插槽中未找到不支持或活动的 eUICC。';
+@@ -3834,7 +3834,7 @@ class AppLocalizationsZhTw extends AppLocalizationsZh {
+ 
+   @override
+   String get accessDeniedSubtitle =>
+-      '存取此 eUICC 需要營運商權限。該卡片的 ARA-M 允許列表與此應用程式的簽章不符。';
++      '管理通道存取被拒絕，具體原因尚未確認。請在「設定 → 9eSIM 診斷」中儲存報告。';
+ 
+   @override
+   String get noCardDetectedSubtitle => '在此插槽中未找到不支援或活動的 eUICC。';
+diff --git a/lib/pages/issue62_diagnostics_page.dart b/lib/pages/issue62_diagnostics_page.dart
+new file mode 100644
+index 0000000..a9cfd4c
+--- /dev/null
++++ b/lib/pages/issue62_diagnostics_page.dart
+@@ -0,0 +1,435 @@
++import 'dart:convert';
++import 'dart:io' as io;
++
++import 'package:file_picker/file_picker.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter/services.dart';
++
++import '../services/issue62_diagnostics.dart';
++import '../utils/platform_adapter.dart';
++import '../widgets/styled_header_scaffold.dart';
++
++class Issue62DiagnosticsPage extends StatefulWidget {
++  const Issue62DiagnosticsPage({super.key, this.diagnostics});
++
++  final Issue62Diagnostics? diagnostics;
++
++  @override
++  State<Issue62DiagnosticsPage> createState() => _Issue62DiagnosticsPageState();
++}
++
++class _Issue62DiagnosticsPageState extends State<Issue62DiagnosticsPage> {
++  late final Issue62Diagnostics _diagnostics;
++  bool _busy = true;
++  String? _actionError;
++
++  bool get _zh => Localizations.localeOf(context).languageCode == 'zh';
++  String _t(String zh, String en) => _zh ? zh : en;
++
++  @override
++  void initState() {
++    super.initState();
++    _diagnostics = widget.diagnostics ?? Issue62Diagnostics();
++    _initialize();
++  }
++
++  Future<void> _initialize() async {
++    await _diagnostics.restore();
++    if (!mounted) return;
++    await _diagnostics.capture();
++    if (mounted) setState(() => _busy = false);
++  }
++
++  Future<void> _run(Future<void> Function() operation) async {
++    if (_busy) return;
++    setState(() {
++      _busy = true;
++      _actionError = null;
++    });
++    try {
++      await operation();
++    } catch (error) {
++      if (mounted) _actionError = issue62ErrorText(error);
++    } finally {
++      if (mounted) setState(() => _busy = false);
++    }
++  }
++
++  void _notice(String message) {
++    if (!mounted) return;
++    ScaffoldMessenger.of(
++      context,
++    ).showSnackBar(SnackBar(content: Text(message)));
++  }
++
++  Future<void> _capture(String marker) => _run(() async {
++    final captured = await _diagnostics.capture(marker: marker);
++    if (!mounted) return;
++    if (captured && _diagnostics.storageError == null) {
++      _notice(_t('已记录并保存快照', 'Snapshot captured and saved'));
++    }
++  });
++
++  Future<void> _copy() => _run(() async {
++    await Clipboard.setData(ClipboardData(text: _diagnostics.exportReport()));
++    _notice(_t('已复制脱敏诊断报告', 'Redacted diagnostic report copied'));
++  });
++
++  Future<void> _save() => _run(() async {
++    final stamp = DateTime.now()
++        .toUtc()
++        .toIso8601String()
++        .replaceAll(':', '-')
++        .replaceAll('.', '-');
++    final bytes = Uint8List.fromList(utf8.encode(_diagnostics.exportReport()));
++    final path = await FilePicker.platform.saveFile(
++      dialogTitle: _t('保存诊断报告', 'Save diagnostic report'),
++      fileName: '9esim-test4-diagnostics-$stamp.json',
++      type: FileType.custom,
++      allowedExtensions: const ['json'],
++      bytes: PlatformX.isMobile ? bytes : null,
++    );
++    if (path == null) return;
++    if (!PlatformX.isMobile) {
++      await io.File(path).writeAsBytes(bytes, flush: true);
++    }
++    _notice(_t('诊断文件已保存', 'Diagnostic file saved'));
++  });
++
++  Future<void> _clear() async {
++    if (_busy) return;
++    final confirmed = await showDialog<bool>(
++      context: context,
++      builder: (context) => AlertDialog(
++        title: Text(_t('清空诊断记录？', 'Clear diagnostic records?')),
++        content: Text(
++          _t(
++            '将清除本机的诊断事件和切换前／后快照。卡片与配置不受影响。',
++            'This clears local diagnostic events and before/after snapshots. It does not change the card or its profiles.',
++          ),
++        ),
++        actions: [
++          TextButton(
++            onPressed: () => Navigator.pop(context, false),
++            child: Text(_t('取消', 'Cancel')),
++          ),
++          TextButton(
++            onPressed: () => Navigator.pop(context, true),
++            child: Text(_t('清空', 'Clear')),
++          ),
++        ],
++      ),
++    );
++    if (confirmed != true || !mounted) return;
++    await _run(() async {
++      if (await _diagnostics.clear()) {
++        _notice(_t('诊断记录已清空', 'Diagnostic records cleared'));
++      }
++    });
++  }
++
++  Map<String, dynamic> _map(Object? value) => value is Map
++      ? value.map((key, value) => MapEntry(key.toString(), value))
++      : <String, dynamic>{};
++
++  List<dynamic> _list(Object? value) => value is List ? value : const [];
++
++  String _time(Map<String, dynamic>? snapshot) {
++    final value = snapshot?['generatedAtUtc'];
++    final parsed = value is String ? DateTime.tryParse(value)?.toLocal() : null;
++    if (parsed == null) return _t('未记录', 'Not recorded');
++    return '${parsed.month}/${parsed.day} '
++        '${parsed.hour.toString().padLeft(2, '0')}:'
++        '${parsed.minute.toString().padLeft(2, '0')}:'
++        '${parsed.second.toString().padLeft(2, '0')}';
++  }
++
++  Widget _card({required String title, required List<Widget> children}) => Card(
++    margin: const EdgeInsets.only(bottom: 16),
++    child: Padding(
++      padding: const EdgeInsets.all(18),
++      child: Column(
++        crossAxisAlignment: CrossAxisAlignment.start,
++        children: [
++          Text(title, style: Theme.of(context).textTheme.titleMedium),
++          const SizedBox(height: 12),
++          ...children,
++        ],
++      ),
++    ),
++  );
++
++  Widget _value(String label, Object? value) => Padding(
++    padding: const EdgeInsets.only(bottom: 8),
++    child: SelectableText('$label: ${value ?? _t('未知', 'Unknown')}'),
++  );
++
++  String _privilegeLabel(Object? status) => switch (status) {
++    'granted' => _t('系统确认有权限', 'Confirmed by Android'),
++    'not_confirmed' => _t(
++      '系统未确认（不等于 OMAPI 拒绝）',
++      'Not confirmed (not an OMAPI denial)',
++    ),
++    _ => _t('不可获取', 'Unavailable'),
++  };
++
++  Widget _snapshotSummary() => _card(
++    title: _t('切换前后对照', 'Before / after comparison'),
++    children: [
++      Text(
++        _t(
++          '1. 在能读卡的状态下记录“切换前”。\n2. 返回主界面完成切卡或复现错误。\n3. 回到这里记录“切换后”，保存诊断文件发给排查人员。',
++          '1. Capture “before” while card access works.\n2. Return to the main page and switch profiles or reproduce the error.\n3. Capture “after” here, then save the diagnostic file for review.',
++        ),
++      ),
++      const SizedBox(height: 14),
++      _value(_t('切换前', 'Before'), _time(_diagnostics.beforeSwitch)),
++      _value(_t('切换后', 'After'), _time(_diagnostics.afterSwitch)),
++      Wrap(
++        spacing: 10,
++        runSpacing: 10,
++        children: [
++          FilledButton.icon(
++            onPressed: _busy ? null : () => _capture('before_switch'),
++            icon: const Icon(Icons.bookmark_add_outlined),
++            label: Text(_t('记录切换前', 'Capture before')),
++          ),
++          FilledButton.tonalIcon(
++            onPressed: _busy ? null : () => _capture('after_switch'),
++            icon: const Icon(Icons.compare_arrows),
++            label: Text(_t('记录切换后', 'Capture after')),
++          ),
++          OutlinedButton.icon(
++            onPressed: _busy ? null : () => _capture('manual'),
++            icon: const Icon(Icons.fact_check_outlined),
++            label: Text(_t('采集当前状态', 'Capture current state')),
++          ),
++        ],
++      ),
++      const SizedBox(height: 10),
++      Text(
++        _t(
++          '快照保存在本机，重新打开 App 后仍可查看和导出。',
++          'Snapshots stay on this device and remain available after reopening the app.',
++        ),
++        style: Theme.of(context).textTheme.bodySmall,
++      ),
++    ],
++  );
++
++  Widget _currentSummary(Map<String, dynamic> snapshot) {
++    final app = _map(snapshot['app']);
++    final device = _map(snapshot['device']);
++    final service = _map(snapshot['service']);
++    final telephony = _map(snapshot['telephony']);
++    return _card(
++      title: _t('最新状态', 'Latest captured state'),
++      children: [
++        _value(_t('采集时间', 'Captured'), _time(snapshot)),
++        _value(_t('应用版本', 'App version'), app['versionName']),
++        _value(
++          _t('手机', 'Device'),
++          '${device['manufacturer'] ?? ''} ${device['model'] ?? ''}'.trim(),
++        ),
++        _value(
++          'Android / SDK',
++          '${device['androidRelease'] ?? '?'} / ${device['sdkInt'] ?? '?'}',
++        ),
++        _value(
++          _t('OMAPI 保护状态', 'OMAPI safety guard'),
++          service['poisoned'] == true
++              ? _t('已触发', 'Triggered')
++              : service['poisoned'] == false
++              ? _t('未触发', 'Not triggered')
++              : _t('未知', 'Unknown'),
++        ),
++        for (final item in _list(service['readers'])) ...[
++          _value(_t('读卡器', 'Reader'), _map(item)['reader']),
++          _value(_t('缓存状态', 'Cached status'), _map(item)['statusCached']),
++          _value(
++            _t('已跟踪通道数', 'Tracked channel count'),
++            _map(item)['openChannelCount'],
++          ),
++        ],
++        const Divider(height: 24),
++        Text(
++          _t('Android 运营商权限', 'Android carrier privileges'),
++          style: Theme.of(context).textTheme.titleSmall,
++        ),
++        const SizedBox(height: 8),
++        if (_list(telephony['logicalSlots']).isEmpty)
++          Text(
++            _t(
++              '无法取得逻辑卡槽的订阅映射。',
++              'Logical-slot subscription mapping is unavailable.',
++            ),
++          ),
++        for (final item in _list(telephony['logicalSlots']))
++          _value(
++            '${_t('逻辑卡槽', 'Logical slot')} ${_map(item)['logicalSlotIndex'] ?? '?'}',
++            _privilegeLabel(_map(item)['carrierPrivilegeStatus']),
++          ),
++        const SizedBox(height: 8),
++        Text(
++          _t(
++            '运营商权限与 OMAPI 通道授权是不同检查；逻辑卡槽并未与 SIM1／SIM2 读卡器作确定映射。本报告没有读取卡内 ARA-M 规则。',
++            'Carrier privileges and OMAPI access are separate checks. Logical slots are not confirmed mappings to SIM1/SIM2 readers. No card ARA-M rules were read.',
++          ),
++          style: Theme.of(context).textTheme.bodySmall,
++        ),
++        ExpansionTile(
++          tilePadding: EdgeInsets.zero,
++          title: Text(_t('应用签名指纹', 'App signing fingerprints')),
++          children: [
++            _value(_t('包名', 'Package'), app['packageName']),
++            for (final hash in _list(app['currentSignerSha1']))
++              _value('SHA-1', hash),
++            for (final hash in _list(app['currentSignerSha256']))
++              _value('SHA-256', hash),
++          ],
++        ),
++      ],
++    );
++  }
++
++  Widget _events(Map<String, dynamic>? snapshot) {
++    final events = _list(snapshot?['events']);
++    final recent = events.reversed.take(20).map(_map).toList();
++    return _card(
++      title: _t('最近的原生事件', 'Recent native events'),
++      children: [
++        Text(
++          _t(
++            '当前快照有 ${events.length} 条事件。这里显示最近 20 条，导出文件包含快照中保留的全部事件。',
++            '${events.length} events in this snapshot. Showing the latest 20; the export includes every retained event.',
++          ),
++        ),
++        if (events.isEmpty)
++          Padding(
++            padding: const EdgeInsets.only(top: 12),
++            child: Text(
++              _t(
++                '尚无事件。返回主界面尝试读取卡片，再来采集当前状态。',
++                'No events yet. Try reading the card on the main page, then capture the current state here.',
++              ),
++            ),
++          ),
++        for (final event in recent)
++          Padding(
++            padding: const EdgeInsets.only(top: 12),
++            child: DecoratedBox(
++              decoration: BoxDecoration(
++                color: Theme.of(context).colorScheme.surfaceContainerHighest,
++                borderRadius: BorderRadius.circular(12),
++              ),
++              child: Padding(
++                padding: const EdgeInsets.all(12),
++                child: SizedBox(
++                  width: double.infinity,
++                  child: SelectableText(
++                    [
++                      '${event['timestampUtc'] ?? ''}  ${event['stage'] ?? ''} → ${event['outcome'] ?? ''}',
++                      if (event['reader'] != null) 'Reader: ${event['reader']}',
++                      if (event['aid'] != null) 'AID: ${event['aid']}',
++                      if (event['retry'] != null) 'Retry: ${event['retry']}',
++                      if (event['code'] != null) 'Code: ${event['code']}',
++                      if (event['statusWord'] != null)
++                        'SW: ${event['statusWord']}',
++                      if (event['errorClass'] != null) '${event['errorClass']}',
++                      if (event['message'] != null) '${event['message']}',
++                      if (event['causeChain'] != null)
++                        'Causes: ${jsonEncode(event['causeChain'])}',
++                    ].join('\n'),
++                    style: Theme.of(context).textTheme.bodySmall,
++                  ),
++                ),
++              ),
++            ),
++          ),
++      ],
++    );
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    final recordingError = _map(
++      _diagnostics.current?['recording'],
++    )['storageErrorClass'];
++    final error = [
++      if (_diagnostics.captureError != null)
++        '${_t('诊断操作未完成；已有快照仍可导出', 'Diagnostic operation did not complete; existing snapshots can still be exported')}: ${_diagnostics.captureError}',
++      if (_diagnostics.storageError != null)
++        '${_t('本机保存未完成', 'Local storage did not complete')}: ${_diagnostics.storageError}',
++      if (recordingError != null)
++        '${_t('原生事件的跨重启保存未完成；当前快照仍可导出', 'Native event persistence did not complete; the current snapshot can still be exported')}: $recordingError',
++      ?_actionError,
++    ].join('\n');
++    return StyledHeaderScaffold(
++      title: _t('9eSIM 诊断', '9eSIM diagnostics'),
++      subtitle: _t('Test 4 · 切换前后对照', 'Test 4 · Before / after comparison'),
++      body: ListView(
++        padding: const EdgeInsets.all(16),
++        children: [
++          _card(
++            title: _t('只读诊断', 'Read-only diagnostics'),
++            children: [
++              Text(
++                _t(
++                  '被动记录现有读卡操作的通道结果和异常。这里的采集只读取诊断缓存与系统状态；不会自动切卡或重新打开卡片通道。',
++                  'Passively records channel outcomes and exceptions from existing card operations. Capturing reads diagnostic caches and system metadata; it does not switch profiles or reopen card channels.',
++                ),
++              ),
++            ],
++          ),
++          if (_busy)
++            const Padding(
++              padding: EdgeInsets.only(bottom: 16),
++              child: LinearProgressIndicator(),
++            ),
++          if (error.isNotEmpty)
++            _card(
++              title: _t('诊断提示', 'Diagnostic notice'),
++              children: [SelectableText(error)],
++            ),
++          _snapshotSummary(),
++          _card(
++            title: _t('导出脱敏报告', 'Export redacted report'),
++            children: [
++              Text(
++                _t(
++                  '报告包含切换前／后与最近一次快照、公开签名指纹和脱敏异常，不包含 APDU 正文、卡号、EID、IMSI、IMEI、手机号或激活码。文件由你选择保存或发送，App 不会自动上传。',
++                  'Includes before/after and latest snapshots, public signer fingerprints and redacted exceptions. APDU bodies, card identifiers, EID, IMSI, IMEI, phone numbers and activation codes are excluded. You choose where to save or send it; the app does not upload it automatically.',
++                ),
++              ),
++              const SizedBox(height: 14),
++              Wrap(
++                spacing: 10,
++                runSpacing: 10,
++                children: [
++                  FilledButton.icon(
++                    onPressed: _busy ? null : _save,
++                    icon: const Icon(Icons.save_alt),
++                    label: Text(_t('保存诊断文件', 'Save diagnostic file')),
++                  ),
++                  OutlinedButton.icon(
++                    onPressed: _busy ? null : _copy,
++                    icon: const Icon(Icons.copy),
++                    label: Text(_t('复制报告', 'Copy report')),
++                  ),
++                  TextButton.icon(
++                    onPressed: _busy ? null : _clear,
++                    icon: const Icon(Icons.delete_outline),
++                    label: Text(_t('清空记录', 'Clear records')),
++                  ),
++                ],
++              ),
++            ],
++          ),
++          if (_diagnostics.current != null)
++            _currentSummary(_diagnostics.current!),
++          _events(_diagnostics.current),
++        ],
++      ),
++    );
++  }
++}
+diff --git a/lib/pages/settings_page.dart b/lib/pages/settings_page.dart
+index bdd1aca..9506cdf 100644
+--- a/lib/pages/settings_page.dart
++++ b/lib/pages/settings_page.dart
+@@ -20,6 +20,7 @@ import 'settings/redaction_settings_page.dart';
+ import 'settings/reader_types_settings_page.dart';
+ import 'settings/ble_devices_settings_page.dart';
+ import 'app_logs_page.dart';
++import 'issue62_diagnostics_page.dart';
+ import 'adb_bridge_connect_page.dart';
+ import 'settings/tags_and_reminders_page.dart';
+ 
+@@ -240,6 +241,14 @@ class SettingsPage extends StatelessWidget {
+ 
+               // Define all sections in order
+               final List<Widget> allSections = [
++                if (PlatformX.isAndroid)
++                  _buildSection(
++                    context,
++                    title: Localizations.localeOf(context).languageCode == 'zh'
++                        ? '9eSIM 诊断'
++                        : '9eSIM diagnostics',
++                    children: [_buildIssue62DiagnosticsLink(context, width)],
++                  ),
+                 _buildSection(
+                   context,
+                   title: l10n.appearance,
+@@ -1565,6 +1574,27 @@ class SettingsPage extends StatelessWidget {
+     );
+   }
+ 
++  Widget _buildIssue62DiagnosticsLink(
++    BuildContext context,
++    double screenWidth,
++  ) {
++    final zh = Localizations.localeOf(context).languageCode == 'zh';
++    return _buildResponsiveTile(
++      context,
++      screenWidth: screenWidth,
++      icon: const Icon(Icons.fact_check_outlined),
++      title: zh ? '切卡诊断与报告' : 'Profile-switch diagnostics',
++      subtitle: zh
++          ? '记录切换前后状态，保存脱敏日志'
++          : 'Capture before/after states and save redacted logs',
++      child: const Icon(Icons.chevron_right),
++      onTap: () => Navigator.push(
++        context,
++        MaterialPageRoute(builder: (context) => const Issue62DiagnosticsPage()),
++      ),
++    );
++  }
++
+   Widget _buildReaderTypesLink(BuildContext context, double screenWidth) {
+     final l10n = AppLocalizations.of(context)!;
+     return _buildResponsiveTile(
+diff --git a/lib/services/issue62_diagnostics.dart b/lib/services/issue62_diagnostics.dart
+new file mode 100644
+index 0000000..2ade15a
+--- /dev/null
++++ b/lib/services/issue62_diagnostics.dart
+@@ -0,0 +1,434 @@
++import 'dart:async';
++import 'dart:convert';
++
++import 'package:flutter/services.dart';
++import 'package:shared_preferences/shared_preferences.dart';
++
++/// Separate from LogBuffer: that buffer may contain APDUs and subscriber data.
++abstract interface class Issue62SnapshotStore {
++  Future<String?> read();
++  Future<void> write(String value);
++  Future<void> clear();
++}
++
++class PreferencesIssue62SnapshotStore implements Issue62SnapshotStore {
++  static const key = 'issue62.diagnostics.snapshots.v1';
++
++  @override
++  Future<String?> read() async =>
++      (await SharedPreferences.getInstance()).getString(key);
++
++  @override
++  Future<void> write(String value) async {
++    if (!await (await SharedPreferences.getInstance()).setString(key, value)) {
++      throw StateError('Local snapshot storage did not confirm the write');
++    }
++  }
++
++  @override
++  Future<void> clear() async {
++    if (!await (await SharedPreferences.getInstance()).remove(key)) {
++      throw StateError('Local snapshot storage did not confirm removal');
++    }
++  }
++}
++
++String redactIssue62Text(String value) {
++  var text = value;
++  text = text.replaceAll(
++    RegExp(r'LPA:\d+\$[^\s\r\n]+', caseSensitive: false),
++    '[redacted activation code]',
++  );
++  text = text.replaceAll(
++    RegExp(r'https?://[^\s<>]+', caseSensitive: false),
++    '[redacted URL]',
++  );
++  text = text.replaceAll(
++    RegExp(r'[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}', caseSensitive: false),
++    '[redacted email]',
++  );
++  text = text.replaceAll(
++    RegExp(
++      r'''["']?\b(?:ICCID|EID|IMSI|IMEI|MSISDN|phone(?:Number)?|activation(?:Code|Token)?|matchingId|password|token|PIN|PUK|APDU|ATR|selectResponse|commandData|responseData|command|response)\b["']?\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^,;\r\n]+)''',
++      caseSensitive: false,
++    ),
++    '[redacted identifier]',
++  );
++  // Do not retain an APDU/ATR/response accidentally embedded in an exception.
++  text = text.replaceAll(
++    RegExp(
++      r'(?:APDU|ATR|selectResponse|response)\s*[:=]\s*(?:[0-9A-F]{2}[\s:-]*){4,}',
++      caseSensitive: false,
++    ),
++    '[redacted card bytes]',
++  );
++  text = text.replaceAll(
++    RegExp(r'0x[0-9A-Fa-f]{16,}'),
++    '[redacted card bytes]',
++  );
++  text = text.replaceAll(
++    RegExp(r'(?:\b[0-9A-Fa-f]{2}[\s:-]+){7,}[0-9A-Fa-f]{2}\b'),
++    '[redacted card bytes]',
++  );
++  text = text.replaceAll(
++    RegExp(r'(?<![A-Za-z0-9])[0-9A-Fa-f]{24,}(?![A-Za-z0-9])'),
++    '[redacted long value]',
++  );
++  text = text.replaceAll(
++    RegExp(r'\+?\d[\d(). \t-]{6,}\d'),
++    '[redacted number]',
++  );
++  return text.length <= 1200 ? text : '${text.substring(0, 1200)}[truncated]';
++}
++
++String issue62ErrorText(Object error) {
++  if (error is PlatformException) {
++    return redactIssue62Text(
++      '${error.code}: ${error.message ?? 'Native diagnostic request failed'}',
++    );
++  }
++  if (error is TimeoutException) return 'Diagnostic operation timed out';
++  return redactIssue62Text(error.toString());
++}
++
++Map<String, dynamic> _map(Object? value) => value is Map
++    ? value.map((key, value) => MapEntry(key.toString(), value))
++    : <String, dynamic>{};
++
++Object? _safeValue(Object? value, String key) {
++  if (value == null || value is bool || value is num) return value;
++  if (value is List) {
++    return value.take(16).map((entry) => _safeValue(entry, key)).toList();
++  }
++  if (value is! String) return null;
++  if ((key == 'currentSignerSha1' || key == 'currentSignerSha256') &&
++      RegExp(r'^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$').hasMatch(value)) {
++    return value;
++  }
++  if (key == 'aid' && RegExp(r'^[0-9a-fA-F]{10,32}$').hasMatch(value)) {
++    return value;
++  }
++  if ((key == 'generatedAtUtc' || key == 'timestampUtc') &&
++      DateTime.tryParse(value) != null) {
++    return value;
++  }
++  return redactIssue62Text(value);
++}
++
++Map<String, dynamic> _fields(Object? source, List<String> names) {
++  final input = _map(source);
++  return {
++    for (final name in names)
++      if (input.containsKey(name)) name: _safeValue(input[name], name),
++  };
++}
++
++Map<String, dynamic> _safeEvent(Object? value) {
++  final input = _map(value);
++  final event = _fields(input, const [
++    'timestampUtc',
++    'stage',
++    'outcome',
++    'reader',
++    'aid',
++    'retry',
++    'errorClass',
++    'message',
++    'code',
++    'statusWord',
++  ]);
++  final causes = input['causeChain'];
++  if (causes is List) {
++    event['causeChain'] = causes
++        .take(6)
++        .map(
++          (cause) => cause is Map
++              ? _fields(cause, const ['errorClass', 'message'])
++              : _safeValue(cause, 'message'),
++        )
++        .toList();
++  }
++  return event;
++}
++
++/// Whitelist the dedicated native schema, including during restoration.
++/// This intentionally cannot export LogBuffer, arbitrary PlatformException
++/// details, profile metadata, or newly added unknown native fields.
++Map<String, dynamic> sanitizeIssue62Snapshot(Object? raw) {
++  final input = _map(raw);
++  if (input['schemaVersion'] != 1) {
++    throw const FormatException('Unsupported diagnostic schema');
++  }
++  final service = _fields(input['service'], const [
++    'initialized',
++    'connectedLastObserved',
++    'profileSwitchInProgress',
++    'poisoned',
++    'poisonReason',
++  ]);
++  final readers = _map(input['service'])['readers'];
++  service['readers'] = readers is List
++      ? readers
++            .take(16)
++            .map(
++              (reader) => _fields(reader, const [
++                'reader',
++                'statusCached',
++                'secureElementPresentLastObserved',
++                'hasSession',
++                'openChannelCount',
++                'successfulChannelPreviouslyOpened',
++              ]),
++            )
++            .toList()
++      : <Object?>[];
++  final telephony = _fields(input['telephony'], const [
++    'status',
++    'mappingNote',
++    'errorClass',
++    'message',
++  ]);
++  final slots = _map(input['telephony'])['logicalSlots'];
++  telephony['logicalSlots'] = slots is List
++      ? slots
++            .take(16)
++            .map(
++              (slot) => _fields(slot, const [
++                'logicalSlotIndex',
++                'simState',
++                'subscriptionMappingStatus',
++                'subscriptionId',
++                'hasCarrierPrivileges',
++                'carrierPrivilegeStatus',
++                'errorClass',
++                'message',
++                'simStateErrorClass',
++              ]),
++            )
++            .toList()
++      : <Object?>[];
++  final allEvents = input['events'];
++  final events = allEvents is List
++      ? allEvents.map(_safeEvent).toList()
++      : <Map<String, dynamic>>[];
++  var exportDropped = input['exportDroppedEventCount'] is int
++      ? input['exportDroppedEventCount'] as int
++      : 0;
++  if (events.length > 512) {
++    exportDropped += events.length - 512;
++    events.removeRange(0, events.length - 512);
++  }
++  final snapshot = <String, dynamic>{
++    'schemaVersion': 1,
++    'generatedAtUtc': _safeValue(input['generatedAtUtc'], 'generatedAtUtc'),
++    'app': _fields(input['app'], const [
++      'packageName',
++      'versionName',
++      'versionCode',
++      'currentSignerSha1',
++      'currentSignerSha256',
++      'errorClass',
++      'message',
++    ]),
++    'device': _fields(input['device'], const [
++      'manufacturer',
++      'model',
++      'sdkInt',
++      'androidRelease',
++    ]),
++    'service': service,
++    'telephony': telephony,
++    'events': events,
++    'droppedEventCount': input['droppedEventCount'] is int
++        ? input['droppedEventCount']
++        : 0,
++    'exportDroppedEventCount': exportDropped,
++    'recording': _fields(input['recording'], const [
++      'mode',
++      'eventLimit',
++      'persistence',
++      'omitted',
++      'evidenceNote',
++      'storageErrorClass',
++    ]),
++  };
++  while (utf8.encode(jsonEncode(snapshot)).length >
++          Issue62Diagnostics.maxSnapshotBytes &&
++      events.isNotEmpty) {
++    final removeCount = (events.length / 2).ceil();
++    events.removeRange(0, removeCount);
++    exportDropped += removeCount;
++    snapshot['exportDroppedEventCount'] = exportDropped;
++  }
++  if (utf8.encode(jsonEncode(snapshot)).length >
++      Issue62Diagnostics.maxSnapshotBytes) {
++    throw const FormatException('Diagnostic metadata exceeds size limit');
++  }
++  return snapshot;
++}
++
++class Issue62Diagnostics {
++  Issue62Diagnostics({
++    MethodChannel channel = const MethodChannel('ee.nekoko.omapi_plugin'),
++    Issue62SnapshotStore? store,
++    this.timeout = const Duration(seconds: 10),
++  }) : _channel = channel,
++       _store = store ?? PreferencesIssue62SnapshotStore();
++
++  static const maxSnapshotBytes = 512 * 1024;
++  static const maxStoredBytes = 2 * 1024 * 1024;
++  final MethodChannel _channel;
++  final Issue62SnapshotStore _store;
++  final Duration timeout;
++  Map<String, dynamic>? beforeSwitch;
++  Map<String, dynamic>? afterSwitch;
++  Map<String, dynamic>? current;
++  String? captureError;
++  String? storageError;
++
++  Future<void> restore() async {
++    try {
++      final saved = await _store.read().timeout(timeout);
++      if (saved == null) return;
++      if (utf8.encode(saved).length > maxStoredBytes) {
++        throw const FormatException(
++          'Saved diagnostic report exceeds size limit',
++        );
++      }
++      final data = _map(jsonDecode(saved));
++      if (data['schemaVersion'] != 1) {
++        throw const FormatException('Unsupported saved report schema');
++      }
++      beforeSwitch = data['beforeSwitch'] == null
++          ? null
++          : sanitizeIssue62Snapshot(data['beforeSwitch']);
++      afterSwitch = data['afterSwitch'] == null
++          ? null
++          : sanitizeIssue62Snapshot(data['afterSwitch']);
++      current = data['current'] == null
++          ? null
++          : sanitizeIssue62Snapshot(data['current']);
++      captureError = data['captureError'] is String
++          ? redactIssue62Text(data['captureError'])
++          : null;
++      storageError = null;
++    } catch (error) {
++      storageError = issue62ErrorText(error);
++    }
++  }
++
++  Future<bool> capture({String? marker}) async {
++    if (marker != null &&
++        !const {'before_switch', 'after_switch', 'manual'}.contains(marker)) {
++      throw ArgumentError.value(
++        marker,
++        'marker',
++        'Unsupported diagnostic marker',
++      );
++    }
++    try {
++      final raw = await _channel
++          .invokeMethod<Object?>(
++            'getDiagnostics',
++            marker == null ? null : {'marker': marker},
++          )
++          .timeout(timeout);
++      final snapshot = sanitizeIssue62Snapshot(raw);
++      current = snapshot;
++      if (marker == 'before_switch') beforeSwitch = snapshot;
++      if (marker == 'after_switch') afterSwitch = snapshot;
++      captureError = null;
++    } catch (error) {
++      captureError = issue62ErrorText(error);
++      await _persist();
++      return false;
++    }
++    await _persist();
++    return true;
++  }
++
++  Future<void> _persist() async {
++    try {
++      final encoded = jsonEncode({
++        'schemaVersion': 1,
++        'beforeSwitch': beforeSwitch,
++        'afterSwitch': afterSwitch,
++        'current': current,
++        'captureError': captureError,
++      });
++      if (utf8.encode(encoded).length > maxStoredBytes) {
++        throw const FormatException(
++          'Diagnostic report exceeds local size limit',
++        );
++      }
++      await _store.write(encoded).timeout(timeout);
++      storageError = null;
++    } catch (error) {
++      storageError = issue62ErrorText(error);
++    }
++  }
++
++  Future<bool> clear() async {
++    try {
++      final cleared = await _channel
++          .invokeMethod<bool>('clearDiagnostics')
++          .timeout(timeout);
++      if (cleared != true) {
++        throw StateError('Native diagnostics did not confirm clearing');
++      }
++    } catch (error) {
++      captureError =
++          'Clearing native diagnostics was not confirmed: ${issue62ErrorText(error)}';
++      return false;
++    }
++    try {
++      await _store.clear().timeout(timeout);
++    } catch (error) {
++      storageError =
++          'Native log cleared; local snapshots remain: ${issue62ErrorText(error)}';
++      return false;
++    }
++    beforeSwitch = null;
++    afterSwitch = null;
++    current = null;
++    captureError = null;
++    storageError = null;
++    return true;
++  }
++
++  String exportReport() => const JsonEncoder.withIndent('  ').convert({
++    'reportType': '9esim_issue62_read_only_diagnostics',
++    'schemaVersion': 1,
++    'exportedAtUtc': DateTime.now().toUtc().toIso8601String(),
++    'beforeSwitch': beforeSwitch,
++    'afterSwitch': afterSwitch,
++    'current': current,
++    'captureError': captureError,
++    'storageError': storageError,
++    'interpretation': const [
++      'Carrier privileges and OMAPI access to an AID are separate checks.',
++      'not_confirmed means the Android API returned false, not a proven card-rule denial.',
++      'unavailable means the diagnostic could not be obtained, not a negative result.',
++      'No card ARA-M rules were read. Logical slots are not mapped to OMAPI reader names.',
++      'Snapshots are user-labelled before/after; enabled profile identity is not collected.',
++      'App certificates are public signer fingerprints, not card access rules.',
++    ],
++    'privacy': const {
++      'source':
++          'Dedicated structured native diagnostics; not the raw application log',
++      'excluded': [
++        'APDU payloads',
++        'ATR',
++        'SELECT response',
++        'ICCID',
++        'EID',
++        'IMSI',
++        'IMEI',
++        'phone number',
++        'activation code',
++        'profile names',
++      ],
++      'automaticUpload': false,
++    },
++  });
++}

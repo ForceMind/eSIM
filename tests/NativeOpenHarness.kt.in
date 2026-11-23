@@ -12,7 +12,7 @@ object Build { object VERSION_CODES { const val P = 28 } }
 object Log {
     fun i(tag: String, msg: String) {}
     fun w(tag: String, msg: String) {}
-    fun e(tag: String, msg: String, error: Exception) {}
+    fun e(tag: String, msg: String, error: Exception? = null) {}
 }
 class MethodCall(private val args: Map<String, Any>) {
     @Suppress("UNCHECKED_CAST")
@@ -36,17 +36,17 @@ class Channel(val selectResponse: ByteArray? = byteArrayOf(0x90.toByte(), 0))
 class Session(val open: (ByteArray) -> Channel?) {
     fun openLogicalChannel(aid: ByteArray): Channel? = open(aid)
 }
-class Reader(val name: String, val session: Session) {
-    fun openSession(): Session = session
+class Reader(val name: String, val session: Session, private val openError: Exception? = null) {
+    fun openSession(): Session { openError?.let { throw it }; return session }
 }
-class SEService(val readers: List<Reader>)
+class SEService(val readers: List<Reader>, val isConnected: Boolean = true)
 private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 private fun hexStringToByteArray(hex: String): ByteArray {
     require(hex.length % 2 == 0) { "Hex string must have an even length" }
     return ByteArray(hex.length / 2) { i -> hex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
 }
 
-class Harness(
+internal class Harness(
     private val outcome: (String, Int) -> Any?,
     knownReader: Boolean = false,
     private val poisoned: Boolean = false,
@@ -59,6 +59,12 @@ class Harness(
     val readersWithSuccessfulChannel = mutableSetOf<String>()
     var calls = 0
     var cleanups = 0
+    val diagnosticRecorder = OmapiDiagnosticsRecorder()
+    private fun diagnosticEvent(stage: String, outcome: String, reader: String? = null,
+            aid: String? = null, retry: Int? = null, error: Throwable? = null,
+            code: String? = null, message: String? = null, statusWord: String? = null) {
+        diagnosticRecorder.record(stage, outcome, reader, aid, retry, error, code, message, statusWord)
+    }
     private val session = Session { aid ->
         val answer = outcome(aid.toHex().uppercase(), ++calls)
         if (answer is Exception) throw answer
@@ -101,6 +107,27 @@ class Harness(
 // BEGIN ACTUAL UPSTREAM / PATCHED METHOD
 @@METHOD@@
 // END ACTUAL METHOD
+}
+
+internal class SessionHarness(openError: Exception? = null, connected: Boolean = true, poisoned: Boolean = false) {
+    companion object { const val TAG = "OmapiPlugin" }
+    val diagnosticRecorder = OmapiDiagnosticsRecorder()
+    val readerSessions = mutableMapOf<String, Session>()
+    val readerChannels = mutableMapOf<String, ConcurrentHashMap<String, Channel>>()
+    var diagnosticConnectedLastObserved: Boolean? = null
+    private val cleanupCoordinator = object { val poisonInfo: Any? = if (poisoned) "poisoned" else null }
+    private val seService: SEService? = SEService(listOf(Reader("SIM1", Session { Channel() }, openError)), connected)
+    private fun normalizeReaderName(value: String) = value.substringBefore('|').substringBefore(" (").trim()
+    private fun diagnosticEvent(stage: String, outcome: String, reader: String? = null,
+            aid: String? = null, retry: Int? = null, error: Throwable? = null,
+            code: String? = null, message: String? = null, statusWord: String? = null) {
+        diagnosticRecorder.record(stage, outcome, reader, aid, retry, error, code, message, statusWord)
+    }
+    fun connect(): Session? = getOrCreateSession("SIM1")
+
+// BEGIN ACTUAL SESSION METHOD
+@@SESSION_METHOD@@
+// END ACTUAL SESSION METHOD
 }
 
 fun main() {
@@ -229,6 +256,126 @@ fun main() {
         h.readerChannels.getValue("SIM1")[first] = Channel()
         check(h.open().code == "CHANNEL_ALREADY_OPEN")
         check(h.calls == 0 && h.cleanups == 0)
+    }
+    fun events(recorder: OmapiDiagnosticsRecorder): List<Map<String, Any?>> =
+            (recorder.snapshot()["events"] as List<*>).map { it as Map<String, Any?> }
+    case("each actual AID attempt preserves its exception type and later success") {
+        val h = Harness({ aid, _ -> if (aid == first) SecurityException("no APDU access allowed ICCID=89012345678901234567") else Channel() })
+        check(h.open(listOf(first, second)).code == null)
+        val rows = events(h.diagnosticRecorder).filter { it["stage"] == "openChannel" }
+        check(rows.map { it["outcome"] } == listOf("attempt", "exception", "attempt", "success"))
+        check(rows[1]["errorClass"] == "java.lang.SecurityException")
+        check(rows[1]["aid"] == first && rows[3]["aid"] == second)
+        check(!rows.toString().contains("89012345678901234567"))
+    }
+    case("actual AID null is distinguishable from access denial") {
+        val h = Harness({ aid, _ -> if (aid == first) null else SecurityException("denied") })
+        check(h.open(listOf(first, second)).code == "CHANNEL_FAILED")
+        val rows = events(h.diagnosticRecorder)
+        check(rows.any { it["outcome"] == "null_channel" && it["aid"] == first })
+        check(rows.any { it["outcome"] == "exception" && it["aid"] == second })
+        check(rows.last()["outcome"] == "channel_failure")
+    }
+    case("actual bounded retry is visible without extra hardware calls") {
+        val h = Harness({ _, call -> if (call == 1) IOException("OpenLogicalChannel() failed") else Channel() })
+        check(h.open().code == null && h.calls == 2 && h.cleanups == 1)
+        check(events(h.diagnosticRecorder).any { it["outcome"] == "success" && it["retry"] == 1 })
+    }
+    case("actual session-open failure preserves the swallowed exception") {
+        val h = SessionHarness(SecurityException("denied IMSI=123456789012345"))
+        check(h.connect() == null)
+        val error = events(h.diagnosticRecorder).last()
+        check(error["stage"] == "session.open" && error["errorClass"] == "java.lang.SecurityException")
+        check(!error.toString().contains("123456789012345"))
+    }
+    case("session lookup under poison performs no diagnostic hardware work") {
+        val h = SessionHarness(poisoned = true)
+        check(h.connect() == null && events(h.diagnosticRecorder).isEmpty())
+    }
+    case("session disconnected result is unavailable rather than permission denied") {
+        val h = SessionHarness(connected = false)
+        check(h.connect() == null && h.diagnosticConnectedLastObserved == false)
+        check(events(h.diagnosticRecorder).last()["outcome"] == "service_unavailable")
+    }
+    case("bounded recorder retains newest events and counts discarded entries") {
+        val recorder = OmapiDiagnosticsRecorder(capacity = 3)
+        repeat(5) { recorder.record("stage", "event$it") }
+        check(events(recorder).map { it["outcome"] } == listOf("event2", "event3", "event4"))
+        check(recorder.snapshot()["droppedEventCount"] == 2L)
+    }
+    case("diagnostic callback failure never affects a recorded event") {
+        val recorder = OmapiDiagnosticsRecorder(onChanged = { throw IOException("disk unavailable") })
+        recorder.record("stage", "success")
+        check(events(recorder).size == 1)
+    }
+    case("all common identifiers and activation data are redacted before recording") {
+        val recorder = OmapiDiagnosticsRecorder()
+        recorder.record("stage", "error", error = SecurityException("ICCID=89012345678901234567 EID=12345678901234567890123456789012 IMSI=123456789012345 IMEI=123456789012345 LPA:1\$server.example\$SECRET123 https://example.com/secret foo@example.com"))
+        val text = events(recorder).single()["message"].toString()
+        for (secret in listOf("890123", "123456", "SECRET123", "example.com")) check(!text.contains(secret))
+    }
+    case("short and quoted payloads plus PIN PUK password and activationToken are redacted") {
+        val secrets = listOf("response=DE AD BE EF", "commandData='00 A4 04 00'", "responseData=\"AA BB CC DD\"", "PIN=1234", "PUK='12345678'", "password=\"correct horse battery staple\"", "activationToken=abc-secret", "response=[222, 173, 190, 239]")
+        for (secret in secrets) {
+            val redacted = OmapiDiagnosticsRecorder.redact(secret)
+            check(redacted == "[redacted]") { "$secret -> $redacted" }
+        }
+    }
+    case("public AID remains in a dedicated field while payload-looking message is redacted") {
+        val recorder = OmapiDiagnosticsRecorder()
+        val aid = "A0000005591010FFFFFFFF8900000100"
+        recorder.record("openChannel", "error", aid = aid, message = "APDU=80E2910010AABBCCDDEEFF00112233445566778899")
+        check(events(recorder).single()["aid"] == aid)
+        check(!events(recorder).single()["message"].toString().contains("80E291"))
+    }
+    case("JSON-style quoted field names cannot evade identifier and payload redaction") {
+        check(OmapiDiagnosticsRecorder.redact("{\"activationCode\":\"one-time-secret\"}") == "{[redacted]}")
+        check(OmapiDiagnosticsRecorder.redact("{\"response\":\"DE AD BE EF\"}") == "{[redacted]}")
+    }
+    case("exception cause chain is bounded and redacted") {
+        val recorder = OmapiDiagnosticsRecorder()
+        val cause = IOException("EID=12345678901234567890123456789012")
+        val error = SecurityException("access denied", cause)
+        recorder.record("openChannel", "error", error = error)
+        val row = events(recorder).single()
+        check(row["errorClass"] == "java.lang.SecurityException")
+        check(row["causeChain"].toString().contains("java.io.IOException"))
+        check(!row.toString().contains("123456789"))
+    }
+    case("restore only accepts diagnostic schema and sanitizes old messages") {
+        val recorder = OmapiDiagnosticsRecorder(capacity = 2)
+        recorder.restore(listOf(mapOf("stage" to "restored", "outcome" to "error", "message" to "PIN=1234", "apdu" to "SECRET")), 7)
+        val row = events(recorder).single()
+        check(row["message"] == "[redacted]" && !row.containsKey("apdu"))
+        check(recorder.snapshot()["droppedEventCount"] == 7L)
+    }
+    case("snapshot mutation does not mutate recorder state") {
+        val recorder = OmapiDiagnosticsRecorder()
+        recorder.record("stage", "success")
+        (events(recorder).single() as MutableMap<String, Any?>)["outcome"] = "changed"
+        check(events(recorder).single()["outcome"] == "success")
+    }
+    case("clear removes retained events and dropped count") {
+        val recorder = OmapiDiagnosticsRecorder(capacity = 1)
+        repeat(3) { recorder.record("stage", "success") }
+        recorder.clear()
+        check(events(recorder).isEmpty() && recorder.snapshot()["droppedEventCount"] == 0L)
+    }
+    case("concurrent recording preserves event count and capacity") {
+        val recorder = OmapiDiagnosticsRecorder()
+        val workers = (0 until 4).map { worker -> Thread { repeat(300) { recorder.record("worker$worker", "success") } } }
+        workers.forEach { it.start() }; workers.forEach { it.join() }
+        check(events(recorder).size == 512 && recorder.snapshot()["droppedEventCount"] == 688L)
+    }
+    case("exception text and cyclic causes remain bounded") {
+        val firstError = Exception("x".repeat(20000))
+        val secondError = Exception("cause")
+        firstError.initCause(secondError); secondError.initCause(firstError)
+        val recorder = OmapiDiagnosticsRecorder()
+        recorder.record("stage", "error", error = firstError)
+        val row = events(recorder).single()
+        check(row["message"].toString().length <= 512)
+        check((row["causeChain"] as List<*>).size == 1)
     }
     println("RESULT: $passed passed, $failed failed (JVM doubles, not Android hardware)")
     if (failed > 0) throw AssertionError("$failed tests failed")

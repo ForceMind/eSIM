@@ -73,7 +73,10 @@ jobs:
         run: |
           set -euo pipefail
           dart analyze lib/adapter/omapi/omapi_access_errors.dart \
-            lib/adapter/omapi/omapi_adapter.dart test/issue62/ 2>&1 | tee ../test-results/dart-analyze.log
+            lib/adapter/omapi/omapi_adapter.dart \
+            lib/services/issue62_diagnostics.dart \
+            lib/pages/issue62_diagnostics_page.dart \
+            test/issue62/ 2>&1 | tee ../test-results/dart-analyze.log
       - name: Run Flutter tests
         timeout-minutes: 8
         working-directory: source
@@ -143,18 +146,18 @@ jobs:
         run: |
           python3 scripts/sign_apk.py \
             --input source/build/app/outputs/flutter-apk/app-community-release.apk \
-            --output dist/eSIM-Issue62-Test3-9eSIM-arm64-v8a.apk \
+            --output dist/eSIM-Issue62-Test4-Diagnostics-arm64-v8a.apk \
             --apksigner "$ANDROID_HOME/build-tools/36.0.0/apksigner"
       - name: Verify package identity, release flags, ABI and signature
         run: python3 scripts/verify_apk.py
       - name: Upload tested and verified APK
         uses: actions/upload-artifact@v4
         with:
-          name: issue62-test3-9esim-coexist-apk
+          name: issue62-test4-diagnostics-apk
           if-no-files-found: error
           retention-days: 30
           path: |
-            dist/eSIM-Issue62-Test3-9eSIM-arm64-v8a.apk
+            dist/eSIM-Issue62-Test4-Diagnostics-arm64-v8a.apk
             dist/SHA256SUMS.txt
             dist/build-info.json
             dist/signer.txt
