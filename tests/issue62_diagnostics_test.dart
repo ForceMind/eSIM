@@ -425,10 +425,13 @@ void main() {
       await tester.ensureVisible(before);
       await tester.tap(before);
       await tester.pumpAndSettle();
+      expect(find.byType(SnackBar), findsNothing);
       final copy = find.widgetWithText(OutlinedButton, 'Copy report');
       await tester.ensureVisible(copy);
       await tester.tap(copy);
       await tester.pumpAndSettle();
+      expect(find.byType(SnackBar), findsNothing);
+      expect(find.text('Redacted diagnostic report copied'), findsOneWidget);
       expect(copied, isNotNull);
       expect(jsonDecode(copied!)['beforeSwitch'], isNotNull);
       expect(calls.every((call) => call.method == 'getDiagnostics'), isTrue);

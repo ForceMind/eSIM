@@ -1001,10 +1001,10 @@ index f794c0b..b673861 100644
    String get noCardDetectedSubtitle => '在此插槽中未找到不支援或活動的 eUICC。';
 diff --git a/lib/pages/issue62_diagnostics_page.dart b/lib/pages/issue62_diagnostics_page.dart
 new file mode 100644
-index 0000000..a9cfd4c
+index 0000000..7e6c4dc
 --- /dev/null
 +++ b/lib/pages/issue62_diagnostics_page.dart
-@@ -0,0 +1,435 @@
+@@ -0,0 +1,448 @@
 +import 'dart:convert';
 +import 'dart:io' as io;
 +
@@ -1029,6 +1029,7 @@ index 0000000..a9cfd4c
 +  late final Issue62Diagnostics _diagnostics;
 +  bool _busy = true;
 +  String? _actionError;
++  String? _actionNotice;
 +
 +  bool get _zh => Localizations.localeOf(context).languageCode == 'zh';
 +  String _t(String zh, String en) => _zh ? zh : en;
@@ -1052,6 +1053,7 @@ index 0000000..a9cfd4c
 +    setState(() {
 +      _busy = true;
 +      _actionError = null;
++      _actionNotice = null;
 +    });
 +    try {
 +      await operation();
@@ -1064,9 +1066,7 @@ index 0000000..a9cfd4c
 +
 +  void _notice(String message) {
 +    if (!mounted) return;
-+    ScaffoldMessenger.of(
-+      context,
-+    ).showSnackBar(SnackBar(content: Text(message)));
++    setState(() => _actionNotice = message);
 +  }
 +
 +  Future<void> _capture(String marker) => _run(() async {
@@ -1409,6 +1409,19 @@ index 0000000..a9cfd4c
 +                ),
 +              ),
 +              const SizedBox(height: 14),
++              if (_actionNotice != null)
++                Padding(
++                  padding: const EdgeInsets.only(bottom: 14),
++                  child: Semantics(
++                    liveRegion: true,
++                    child: Text(
++                      _actionNotice!,
++                      style: TextStyle(
++                        color: Theme.of(context).colorScheme.primary,
++                      ),
++                    ),
++                  ),
++                ),
 +              Wrap(
 +                spacing: 10,
 +                runSpacing: 10,
