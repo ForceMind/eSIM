@@ -9,9 +9,9 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parent.parent
 DIST = ROOT / "dist"
-APK = DIST / "eSIM-Issue62-Test4-Diagnostics-arm64-v8a.apk"
+APK = DIST / "eSIM-Issue62-Test5-STK-arm64-v8a.apk"
 SDK = Path(os.environ["ANDROID_HOME"]) / "build-tools/36.0.0"
-APP_ID = "io.github.forcemind.nekokolpa.issue62.v4"
+APP_ID = "io.github.forcemind.nekokolpa.issue62.v5"
 ESIM9_SHA1 = "d1c0f48b370e74d4ea4770ed4c3cd70a3198d31f"
 
 assert APK.is_file() and APK.stat().st_size > 1_000_000
@@ -20,9 +20,9 @@ badging = subprocess.check_output([str(SDK / "aapt"), "dump", "badging", str(APK
 (DIST / "signer.txt").write_text(signer)
 (DIST / "apk-info.txt").write_text(badging)
 assert f"package: name='{APP_ID}'" in badging
-assert "versionCode='4'" in badging
-assert "versionName='2.5.0-issue62.4'" in badging
-assert "application-label:'9eSIM Test 4'" in badging
+assert "versionCode='5'" in badging
+assert "versionName='2.5.0-issue62.5'" in badging
+assert "application-label:'9eSIM Test 5'" in badging
 assert "launchable-activity: name='ee.nekoko.nlpa2.MainActivity'" in badging
 assert "native-code: 'arm64-v8a'" in badging
 assert "application-debuggable" not in badging

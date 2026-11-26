@@ -14,9 +14,9 @@ import xml.etree.ElementTree as ET
 ROOT = Path(__file__).resolve().parent.parent
 UPSTREAM = "https://github.com/iebb/NekokoLPA2.git"
 BASELINE = "6d2145a515557941f10c5ebbf734d01f7d05fb43"
-APP_ID = "io.github.forcemind.nekokolpa.issue62.v4"
-APP_NAME = "9eSIM Test 4"
-VERSION = "2.5.0-issue62.4+4"
+APP_ID = "io.github.forcemind.nekokolpa.issue62.v5"
+APP_NAME = "9eSIM Test 5"
+VERSION = "2.5.0-issue62.5+5"
 ANDROID = "{http://schemas.android.com/apk/res/android}"
 ET.register_namespace("android", ANDROID[1:-1])
 
@@ -55,6 +55,51 @@ def main() -> None:
     run("git", "apply", "--check", str(diagnostics_patch), cwd=source)
     run("git", "apply", str(diagnostics_patch), cwd=source)
 
+    # Add the system STK recovery route after the diagnostic patch.
+    overlay = ROOT / "overlays/stk"
+    for relative in (
+        "android/app/src/main/kotlin/ee/nekoko/nlpa2/StkRecoveryBridge.kt",
+        "lib/pages/stk_recovery_page.dart",
+    ):
+        shutil.copy2(overlay / relative, source / relative)
+
+    activity = source / "android/app/src/main/kotlin/ee/nekoko/nlpa2/MainActivity.kt"
+    activity.write_text(replace_exact(
+        activity.read_text(),
+        "        flutterEngine.plugins.add(AdbBridgePlugin())",
+        '        flutterEngine.plugins.add(AdbBridgePlugin())\n'
+        '        val stkBridge = StkRecoveryBridge(this)\n'
+        '        io.flutter.plugin.common.MethodChannel(flutterEngine.dartExecutor.binaryMessenger,\n'
+        '            "io.github.forcemind/stk_recovery").setMethodCallHandler(stkBridge::handle)',
+    ))
+    settings_page = source / "lib/pages/settings_page.dart"
+    page = replace_exact(settings_page.read_text(), "import 'issue62_diagnostics_page.dart';",
+                         "import 'issue62_diagnostics_page.dart';\nimport 'stk_recovery_page.dart';")
+    page = replace_exact(page, "children: [_buildIssue62DiagnosticsLink(context, width)],",
+                         "children: [_buildIssue62DiagnosticsLink(context, width),\n"
+                         "                      _buildStkRecoveryLink(context, width)],")
+    page = replace_exact(page, "  Widget _buildIssue62DiagnosticsLink(",
+                         """  Widget _buildStkRecoveryLink(BuildContext context, double screenWidth) {
+    final zh = Localizations.localeOf(context).languageCode == 'zh';
+    return _buildResponsiveTile(
+      context,
+      screenWidth: screenWidth,
+      icon: const Icon(Icons.sim_card_outlined),
+      title: zh ? 'SIM 卡工具包（STK）' : 'SIM Toolkit (STK)',
+      subtitle: zh ? '通过系统菜单手动切卡' : 'Switch profiles manually in system UI',
+      child: const Icon(Icons.chevron_right),
+      onTap: () => Navigator.push(
+        context,
+        MaterialPageRoute(builder: (context) => const StkRecoveryPage()),
+      ),
+    );
+  }
+
+  Widget _buildIssue62DiagnosticsLink(""")
+    settings_page.write_text(page)
+    diagnostics_page = source / "lib/pages/issue62_diagnostics_page.dart"
+    diagnostics_page.write_text(diagnostics_page.read_text().replace("Test 4", "Test 5").replace("test4-diagnostics", "test5-diagnostics"))
+
     gradle = source / "android/app/build.gradle.kts"
     text = replace_exact(gradle.read_text(), 'applicationId = "ee.nekoko.nlpa2.open"',
                          f'applicationId = "{APP_ID}"', 2)
@@ -88,6 +133,12 @@ def main() -> None:
                 removed += 1
     if removed != 2:
         raise RuntimeError(f"Expected two original deep-link filters; found {removed}")
+    queries = tree.find("queries")
+    if queries is None:
+        queries = ET.SubElement(tree, "queries")
+    for package in ("com.android.stk", "com.android.stk1", "com.android.stk2"):
+        if not any(p.get(ANDROID + "name") == package for p in queries.findall("package")):
+            ET.SubElement(queries, "package", {ANDROID + "name": package})
     ET.indent(tree, space="    ")
     manifest.write_text(ET.tostring(tree, encoding="unicode") + "\n")
 
@@ -116,6 +167,7 @@ def main() -> None:
         "application_id": APP_ID, "application_name": APP_NAME, "version": VERSION,
         "patch_sha256": hashlib.sha256(patch.read_bytes()).hexdigest(),
         "diagnostics_patch_sha256": hashlib.sha256(diagnostics_patch.read_bytes()).hexdigest(),
+        "stk_recovery": "user-selected public system STK launcher only; no direct CAT or profile writes",
         "diagnostics": "passive native events and read-only snapshots; no ARA-M inspection or card writes",
         "signing_key": "independent ephemeral test key plus official published 9eSIM community key",
         "signing_scheme": "APK v2 with two current signers; not signing lineage",

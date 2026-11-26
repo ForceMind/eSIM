@@ -2,6 +2,10 @@
 
 Independent compatibility and diagnostic builds for [NekokoLPA2 issue #62](https://github.com/iebb/NekokoLPA2/issues/62). This is not an official 9eSIM release. All build work belongs in **ForceMind/eSIM**. The shared LPA source remains pinned to `6d2145a515557941f10c5ebbf734d01f7d05fb43`.
 
+## Test 5: SIM Toolkit recovery entry
+
+Test 5 retains Test 4 diagnostics and adds **Settings → 9eSIM diagnostics → SIM Toolkit (STK)**. It lists enabled, exported launcher activities in known system STK packages (`com.android.stk`, `com.android.stk1`, `com.android.stk2`) and launches only the user-selected entry. It offers system network settings as a separate manual fallback. It never sends CAT commands, changes access rules, or claims a launch request means a profile was switched. Samsung STK may remain unresponsive. Hardware validation is required. The independent package is `io.github.forcemind.nekokolpa.issue62.v5`, version `2.5.0-issue62.5` / code 5. Successful builds publish `issue62-test5-stk-apk` containing `eSIM-Issue62-Test5-STK-arm64-v8a.apk`.
+
 ## Test 4: capture evidence before and after a profile switch
 
 The user confirmed that Test 3 lists profiles while a working profile is enabled, then reports access denied after enabling the affected RedPocket profile. This establishes a profile-dependent access failure in that test. It does **not** establish which ARA-M rule applies, that a rule was overwritten, or that a card firmware defect has been proven.
@@ -68,7 +72,7 @@ Both signatures are applied in one `apksigner` invocation. Verification requires
 
 ## Build and download
 
-Open **Actions → Issue62 tests and coexist APK**. Successful runs publish **issue62-test4-diagnostics-apk**, containing:
+Open **Actions → Issue62 tests and coexist APK**. Historical Test 4 runs publish **issue62-test4-diagnostics-apk**, containing:
 
 - `eSIM-Issue62-Test4-Diagnostics-arm64-v8a.apk`
 - SHA-256, package inspection and signature verification records
